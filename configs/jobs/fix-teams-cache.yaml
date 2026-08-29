@@ -1,0 +1,71 @@
+# Example USER-INVOKABLE job (#291) — the "困ったとき" (Troubleshoot) tab.
+#
+# A user-invokable job is a normal Manifest with a `client:` block.
+# The block's mere presence opts the job into the Client App catalog
+# over KLP (`jobs.list` → `jobs.execute`); `name` + `category` are
+# required (serde enforces them), `description` + `icon` are optional.
+# Operator-only jobs (inventory / checks / scheduled maintenance) just
+# omit `client:` and never surface to end users.
+#
+# `run_as: user` matters here: this clears the *interactive user's*
+# Teams cache under %APPDATA%, so it must run in their session — not as
+# LocalSystem (which has a different, empty profile).
+#
+# Unlike a check, a user-invokable job needs NO schedule — the end user
+# fires it on demand from the Client App. Just register the job:
+#   kanade job create configs/jobs/fix-teams-cache.yaml
+#
+# This is also the shape a check's `troubleshoot:` remediation job
+# takes — the "修復する" button on the Health tab runs a job exactly
+# like this one.
+id: fix-teams-cache
+tags: [troubleshoot, app]   # operator taxonomy for the SPA tag filter
+version: 1.0.0
+description: Clear the Microsoft Teams cache for the current user (operator note)
+execute:
+  shell: powershell
+  run_as: user
+  # 180s (not 60s): a large GPUCache/LocalCache — or an APPDATA that's
+  # redirected to a slow roaming/network profile — can take well over a
+  # minute to delete even when it's progressing fine. The per-path
+  # `removing ...` progress output below is what tells a slow-but-working
+  # run apart from a genuine hang when this *does* time out.
+  timeout: 180s
+  script: |
+    # Stop globally so a Remove-Item failure (locked file, denied ACL)
+    # surfaces as a failed job instead of a false success. Only the
+    # process-stop is allowed to be best-effort (Teams may not be
+    # running), via a targeted -ErrorAction SilentlyContinue.
+    $ErrorActionPreference = 'Stop'
+    Write-Output 'stopping Teams processes'
+    Get-Process -Name Teams, ms-teams -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $paths = @(
+      "$env:APPDATA\Microsoft\Teams\Cache",
+      "$env:APPDATA\Microsoft\Teams\GPUCache",
+      "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache"
+    )
+    foreach ($p in $paths) {
+      if (Test-Path $p) {
+        # Emit BEFORE the delete so a timeout/hang leaves the offending
+        # path as the last stdout line — that's the whole diagnostic.
+        Write-Output "removing $p"
+        try {
+          Remove-Item $p -Recurse -Force
+        } catch {
+          # Make WHICH path failed (and why) explicit on stderr instead
+          # of letting the bare $ErrorActionPreference='Stop' throw bury
+          # it. Re-throw so the job still ends as Failed, not a false 0.
+          Write-Error "failed to remove ${p}: $($_.Exception.Message)"
+          throw
+        }
+      } else {
+        Write-Output "skip (absent) $p"
+      }
+    }
+    Write-Output 'Teams cache cleared. Please relaunch Teams.'
+client:
+  name: "Teams のキャッシュをクリア"
+  description: "Teams が重い・固まるときに試してください(再起動が必要です)"
+  category: troubleshoot
+  icon: brush-cleaning

@@ -1,0 +1,167 @@
+# Sample inventory probe — operator-customisable hardware snapshot
+# delivered through the regular deploy + ExecResult pipeline.
+#
+# This file is a Manifest (the shape that `kanade exec` and
+# `kanade job create` both expect).
+#
+# Two ways to use it:
+#
+#   * One-shot — fires immediately against every targeted PC:
+#         kanade exec configs/jobs/inventory-hw.yaml
+#     (Not registered in the catalog; inventory facts are NOT projected
+#     because the projector only matches against registered jobs.)
+#
+#   * Register + schedule — periodic, fact projection enabled:
+#         kanade job create configs/jobs/inventory-hw.yaml
+#         kanade schedule create configs/schedules/hourly-inventory.yaml
+#     The schedule yaml just references this job by id; editing this
+#     file and re-running `kanade job create` rewrites what every
+#     downstream schedule fires from the next tick.
+#
+# The `inventory:` section is what tags this job as an inventory probe.
+# Without it the job runs and stores its output in execution_results
+# like any other scheduled job; with it the results projector ALSO
+# upserts a row into `inventory_facts` keyed by (pc_id, manifest.id),
+# and the SPA Inventory page renders the columns declared in `display`.
+
+id: inventory-hw
+tags: [inventory]   # operator taxonomy for the SPA tag filter
+version: 0.1.0
+description: Hardware inventory snapshot via Get-CimInstance
+execute:
+  shell: powershell
+  timeout: 60s
+  # The script MUST emit a single JSON object on stdout. ConvertTo-Json
+  # -Compress keeps the payload small enough to fit through NATS; -Depth
+  # 5 captures the nested disk list without truncation.
+  script: |
+    $ErrorActionPreference = 'Stop'
+    $cs    = Get-CimInstance Win32_ComputerSystem
+    $os    = Get-CimInstance Win32_OperatingSystem
+    $bios  = Get-CimInstance Win32_Bios
+    $cpus  = @(Get-CimInstance Win32_Processor)
+    $cpu   = $cpus | Select-Object -First 1
+    $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' |
+        ForEach-Object {
+            [pscustomobject]@{
+                device_id   = $_.DeviceID
+                size_bytes  = [int64]($_.Size      | ForEach-Object { if ($_ -eq $null) { 0 } else { $_ } })
+                free_bytes  = [int64]($_.FreeSpace | ForEach-Object { if ($_ -eq $null) { 0 } else { $_ } })
+                file_system = $_.FileSystem
+            }
+        })
+    $displayVersion = $null
+    $osBuild = $os.BuildNumber
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion") {
+        $displayVersion = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "DisplayVersion" -ErrorAction SilentlyContinue
+        if (-not $displayVersion) {
+            $displayVersion = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "ReleaseId" -ErrorAction SilentlyContinue
+        }
+        $currentBuild = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "CurrentBuild" -ErrorAction SilentlyContinue
+        $ubr = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "UBR" -ErrorAction SilentlyContinue
+        if ($currentBuild -and $null -ne $ubr) {
+            $osBuild = "${currentBuild}.${ubr}"
+        } elseif ($currentBuild) {
+            $osBuild = $currentBuild
+        }
+    }
+    [pscustomobject]@{
+        hostname    = $cs.Name
+        pc_model    = $cs.Model
+        serial_number = $bios.SerialNumber
+        os_name     = $os.Caption
+        os_version  = $os.Version
+        os_build    = $osBuild
+        os_display_version = $displayVersion
+        cpu_model   = $cpu.Name
+        cpu_cores   = ($cpus | Measure-Object -Property NumberOfCores -Sum).Sum
+        ram_bytes   = [int64]$cs.TotalPhysicalMemory
+        disks       = $disks
+    } | ConvertTo-Json -Compress -Depth 5
+
+# Display config — drives the SPA Inventory page table for this
+# manifest. `field` is the top-level JSON key, `label` is the
+# column header, `type` (optional) is a render hint:
+#   "bytes"     — humanised (KiB / MiB / GiB)
+#   "number"    — locale-formatted integer
+#   omitted     — plain text
+#
+# Two column sets:
+#   `display` — vertical "field / value" table on the per-PC detail page.
+#               Should cover everything an operator might want to see.
+#   `summary` — horizontal table on the fleet list page (row per PC).
+#               Pick 3-5 columns that fit on a wide-but-not-huge table.
+#               Omitting `summary` falls back to `display`.
+inventory:
+  display:
+    - { field: hostname,           label: Hostname  }
+    - { field: pc_model,           label: Model     }
+    - { field: serial_number,      label: Serial    }
+    - { field: os_name,            label: OS        }
+    - { field: os_version,         label: Version   }
+    - { field: os_display_version, label: winver    }
+    - { field: os_build,           label: OS Build  }
+    - { field: cpu_model,          label: CPU       }
+    - { field: cpu_cores,          label: Cores,    type: number }
+    - { field: ram_bytes,          label: RAM,      type: bytes  }
+    # v0.30 / #39: `type: table` makes the SPA detail page render
+    # `disks: [{device_id, size_bytes, free_bytes, file_system}]`
+    # as a nested sub-table using `columns` as the schema. The
+    # fleet summary view collapses it to a row count to keep the
+    # wide list scannable.
+    - field: disks
+      label: Disks
+      type: table
+      columns:
+        - { field: device_id,   label: Drive }
+        - { field: size_bytes,  label: Size,  type: bytes }
+        - { field: free_bytes,  label: Free,  type: bytes }
+        - { field: file_system, label: FS    }
+  summary:
+    - { field: hostname,           label: Hostname }
+    - { field: pc_model,           label: Model    }
+    - { field: serial_number,      label: Serial   }
+    - { field: os_name,            label: OS       }
+    - { field: os_display_version, label: winver   }
+    - { field: os_build,           label: OS Build }
+    - { field: cpu_cores,          label: Cores,   type: number }
+    - { field: ram_bytes,          label: RAM,     type: bytes  }
+  # v0.31 / #40: explode `disks[]` into a derived flat table so
+  # cross-PC searches ("which PCs have C: under 10 GB free") are
+  # normal SQL filters. The backend ensures this table at startup
+  # (and the search + projector paths are idempotent) and replaces
+  # this PC's rows on every result.
+  # PK = (pc_id, job_id, device_id) — same device_id from the same
+  # PC's same job dedupes; different PCs / different scans don't
+  # collide.
+  explode:
+    - field: disks
+      table: inventory_hw_disks
+      primary_key: [device_id]
+      # v0.31 / #41: track add / remove / size-change events into
+      # `inventory_history` so operators can answer "when did C:
+      # free space drop sharply" and "which PCs got a new drive in
+      # the last 30 days." Default 90-day retention sweeper bounds
+      # storage.
+      track_history: true
+      columns:
+        - { field: device_id,   type: text                  }
+        - { field: size_bytes,  type: integer, index: false }
+        - { field: free_bytes,  type: integer, index: true  }
+        - { field: file_system, type: text,    index: false }
+  # v0.35 / #93: also track changes to top-level scalar fields the
+  # script emits. `explode.track_history` above covers per-disk
+  # adds / removes / size-changes; `history_scalars` here covers
+  # the single-valued fields that operators want trended on a per-
+  # PC basis — RAM upgrades, OS bumps (10 → 11, 23H2 → 24H2),
+  # firmware / CPU swaps (rare, but useful as anomaly signals).
+  # Same `inventory_history` table, `identity_json IS NULL`
+  # distinguishes scalar events from explode-row events.
+  history_scalars:
+    - ram_bytes
+    - os_version
+    - os_build
+    - os_display_version
+    - cpu_model
+    - pc_model
+    - serial_number

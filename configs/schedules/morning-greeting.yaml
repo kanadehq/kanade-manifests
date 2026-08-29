@@ -1,0 +1,35 @@
+# Schedule demonstrating the calendar `when` form (#418 Phase 2)
+# and `starting_deadline` (v0.22).
+#
+# Fires at 9:00 every weekday and shows a toast / notification to
+# the logged-in user. If the broker / agent was offline at 9:00 and
+# only delivered the Command at 11:00, we'd rather skip than have
+# a "good morning" pop up two hours late.
+#
+# `when.calendar` is a wall-clock time trigger: fires the whole
+# target at `at` on the listed `days`, no per-pc dedup (a greeting
+# isn't a desired-state job). `tz: local` evaluates 09:00 in the
+# running host's timezone (the backend server's for runs_on:
+# backend) — here JST on the minipc. For a one-shot, write a
+# date into `at` instead (e.g. `at: "2026-06-10 09:00"`, no days).
+#
+# `starting_deadline: 30m` → if the agent doesn't receive the
+# Command within 30 minutes of 9:00, it publishes a synthetic
+# skipped-result (exit_code 125 + explanatory stderr) so the
+# operator sees the miss on the Results page.
+#
+# Compare with `configs/schedules/kitting-once.yaml` (no deadline),
+# where catching up later is exactly what we want.
+
+id: morning-greeting
+tags: [sample]   # operator taxonomy for the SPA tag filter
+when:
+  calendar:
+    at: "09:00"           # 9:00 in tz (sec/min auto)
+    days: [mon-fri]       # weekdays; cron DOW names/ranges
+tz: local                 # 09:00 in the host's local TZ (minipc = JST)
+enabled: true
+job_id: show-toast        # replace with your real toast/notify job
+target:
+  all: true
+starting_deadline: 30m
