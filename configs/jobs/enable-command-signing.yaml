@@ -1,0 +1,135 @@
+# Turn signature enforcement ON for a machine. This is the last step of the
+# rollout: distribute the keyring, confirm coverage, then enforce.
+#
+#   kanade job create      configs/jobs/enable-command-signing.yaml
+#   kanade schedule create configs/schedules/enable-command-signing.yaml
+#
+# ## Read this before applying
+#
+# After this runs, the machine REFUSES any command whose provenance does not
+# verify. Get the ring wrong and it refuses everything, including the command
+# that would fix it — recovery is then break-glass (`kanade run` with the
+# break-glass key) or a site visit.
+#
+# Two independent gates stand in front of that, and they answer different
+# questions:
+#
+# * **Targeting** — the schedule aims at the `command-signing-ready` group,
+#   whose membership requires that the host has actually REPORTED a successful
+#   verification. That is the only evidence the ring works; a local check can
+#   prove presence, never correctness.
+# * **This script** — re-checks the expected kids immediately before writing.
+#   Membership was computed up to `refresh` ago and the job may have queued
+#   behind an offline window; the ring can have changed in between.
+#
+# Neither is redundant. The first proves the ring worked; the second proves it
+# still holds at the moment of the write.
+#
+# ## Placeholders
+#
+# The kid literals must match the ring in
+# `configs/jobs/provision-command-keys.yaml` and the query in
+# `configs/groups/command-signing-ready.yaml`. All three move together in a
+# rotation.
+id: enable-command-signing
+tags: [security, signing]
+version: 0.1.0
+description: "Turn on command-signature enforcement, after re-verifying the keyring locally"
+
+execute:
+  shell: powershell
+  run_as: system
+  timeout: 60s
+  script: |
+    $ErrorActionPreference = 'Stop'
+
+    # The exact ring this host must hold - kid AND public key, nothing more.
+    # Keep in lockstep with configs/jobs/provision-command-keys.yaml; the
+    # exact-set comparison below is what makes a drift between the two files
+    # fail loudly instead of silently enabling on the wrong ring.
+    $expected = @(
+      @{ kid = 'REPLACE-backend-kid';     public_key = 'REPLACE-backend-public-key' }
+      @{ kid = 'REPLACE-break-glass-kid'; public_key = 'REPLACE-break-glass-public-key' }
+    )
+    # Shape-check rather than hunting for a placeholder string: 32 bytes of
+    # base64 is 44 chars ending in '='. Catches an unsubstituted template, a
+    # pasted kid, and a truncated copy in one rule.
+    foreach ($w in $expected) {
+      if ($w.public_key -notmatch '^[A-Za-z0-9+/]{43}=$') {
+        throw "expected entry '$($w.kid)' does not carry a 32-byte base64 public key - fill the manifest in before applying"
+      }
+    }
+
+    $subkey = 'SOFTWARE\kanade\agent'
+    $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subkey)
+    if (-not $rk) { throw "HKLM\$subkey is not present - this host was never deployed properly" }
+    try { $ring = $rk.GetValue('CommandKeys') } finally { $rk.Close() }
+
+    if ([string]::IsNullOrWhiteSpace($ring)) {
+      throw 'this host holds NO command-signing keys - enabling would refuse every command, including the one that would provision them. Run provision-command-keys first.'
+    }
+    # Assign FIRST, then wrap: `@($x | ConvertFrom-Json)` collapses the array
+    # into one element on Windows PowerShell 5.1, which would make the
+    # membership check below pass on a ring it never actually inspected.
+    $parsed = ConvertFrom-Json -InputObject $ring
+    $held   = @($parsed)
+
+    # ---- the ring must match EXACTLY: kid, public key, and nothing extra ----
+    #
+    # Checking kids alone leaves three holes, and they get progressively worse:
+    #
+    #  1. STALE  - a host holding only the previous backend key. The agent's
+    #     own guard declines to enforce on an EMPTY ring but sails past a
+    #     non-empty stale one, so it would enforce and then refuse everything
+    #     the backend signs. (Caught by kid alone.)
+    #  2. WRONG KEY - the right kid carrying different bytes, from a mistyped
+    #     paste or a same-kid-different-key mint. Every command comes back
+    #     Invalid, and because the key IS present the agent's
+    #     reload-on-unknown-key path never fires, so nothing self-heals.
+    #  3. EXTRA KEY - an entry nobody put here on purpose. This is the trust
+    #     root: whoever can add a public key to this ring becomes a legitimate
+    #     signer for this machine. Enabling enforcement on a ring with an
+    #     unexplained entry would bless exactly that.
+    #
+    # What this canNOT prove is that the expected values are themselves right:
+    # they come from the same repo revision that wrote the ring, so a public
+    # key mistyped in BOTH files agrees with itself. That is why membership of
+    # `command-signing-ready` also requires the host to have REPORTED
+    # `command_signature_ok` - a real signature verifying against the real
+    # signer. Consistency here, correctness there; neither replaces the other.
+    $problems = [System.Collections.Generic.List[string]]::new()
+    foreach ($want in $expected) {
+      $match = @($held | Where-Object { $_.kid -eq $want.kid })
+      if ($match.Count -eq 0) {
+        $problems.Add("missing kid '$($want.kid)'")
+      } elseif ($match[0].public_key -ne $want.public_key) {
+        # Deliberately does not print either key. They are public, but an
+        # operator comparing two base64 blobs in a job log is how a mismatch
+        # gets waved through; naming the kid is the actionable part.
+        $problems.Add("kid '$($want.kid)' holds a DIFFERENT public key than expected")
+      }
+    }
+    foreach ($h in $held) {
+      if (-not ($expected | Where-Object { $_.kid -eq $h.kid })) {
+        $problems.Add("unexpected key '$($h.kid)' is present - this ring trusts something not in the manifest")
+      }
+    }
+    if ($problems.Count) {
+      throw "keyring does not match the expected ring: $($problems -join '; '). Holding: $(@($held | ForEach-Object { $_.kid }) -join ', '). Re-run provision-command-keys and let this host report command_signature_ok before enabling."
+    }
+
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subkey, $true)
+    if (-not $key) { throw "HKLM\$subkey could not be opened for writing" }
+    try {
+      $key.SetValue('RequireSignedCommands', '1', [Microsoft.Win32.RegistryValueKind]::String)
+    } finally {
+      $key.Close()
+    }
+
+    # Read back, and say plainly that it is not live yet. The agent resolves
+    # this value once at startup — deliberately, so that "was this host
+    # enforcing when it refused?" stays answerable after the fact — which
+    # means enforcement begins at the next agent restart, not now.
+    $rk2 = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subkey)
+    try { $written = $rk2.GetValue('RequireSignedCommands') } finally { $rk2.Close() }
+    Write-Output "RequireSignedCommands=$written (kids held: $($held -join ', ')). Takes effect at the next agent restart."
