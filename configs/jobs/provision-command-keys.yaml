@@ -1,0 +1,133 @@
+# Provision the command-signing public keyring onto every agent.
+#
+# This file carries the fleet's TRUST ROOT. The values are public keys, so it
+# is not secret — but whoever can change it decides what every endpoint will
+# execute, which is why it lives in a reviewed repo rather than being typed
+# into a console.
+#
+#   kanade job create      configs/jobs/provision-command-keys.yaml
+#   kanade schedule create configs/schedules/provision-command-keys.yaml
+#
+# ## The array is REPLACED, not merged
+#
+# That is what makes emergency revocation possible: "write a ring without the
+# compromised key" only works if this overwrites. It also means every revision
+# must list EVERY key the fleet should trust — dropping one by accident retires
+# it fleet-wide.
+#
+# ## Both keys, in the same pass
+#
+# The break-glass entry is not optional and must not be a later pass. A machine
+# that is offline when break-glass is added keeps a backend-only ring, and once
+# signature enforcement is on, the command carrying the missing key is itself
+# refused — the gap cannot be closed remotely by the channel it breaks.
+#
+# ## Rotation procedure
+#
+# 1. Mint the new key (`kanade-backend command-key-generate --rotate` on the
+#    backend host, or `kanade command-key break-glass` for break-glass).
+# 2. Add the new entry here ALONGSIDE the old one and bump `version` below.
+#    Two keys coexisting is the rotation window, not a mistake.
+# 3. Let the schedule carry it out (`per_pc: once_per_version` — each machine
+#    applies each revision exactly once).
+# 4. Watch coverage: `GET /api/agents` reports `command_keys` per host.
+#    Do NOT retire the old key until every machine lists the new
+#    one — a machine still holding only the old key refuses everything the day
+#    enforcement is on.
+# 5. Remove the retired entry and bump `version` again.
+#
+# ## Placeholders
+#
+# The two `public_key` values below are FLEET-SPECIFIC and must be filled in
+# from the generators before this is applied. They are left as obvious
+# placeholders rather than real-looking base64 so a half-configured apply fails
+# loudly at the agent's `parse_keyring` instead of silently trusting nothing.
+id: provision-command-keys
+tags: [security, signing]
+# Bump on EVERY ring change — the schedule keys "already applied" off this.
+version: 0.2.0
+description: "Provision the command-signing public keyring (backend + break-glass)"
+
+execute:
+  shell: powershell
+  run_as: system
+  timeout: 60s
+  script: |
+    $ErrorActionPreference = 'Stop'
+
+    # The complete ring, on one line. A here-string would be the readable
+    # choice, but `@'` / `'@` must sit at column 0 and this script is indented
+    # inside a YAML block scalar, so the terminator would not parse.
+    $ring = '[{"kid":"REPLACE-backend-kid","label":"backend","public_key":"REPLACE-backend-public-key"},{"kid":"REPLACE-break-glass-kid","label":"break-glass","public_key":"REPLACE-break-glass-public-key","max_age_secs":3600}]'
+
+    # ---- validate BEFORE writing -------------------------------------------
+    # Every way this value can be wrong is silent later: a malformed ring
+    # leaves the agent holding nothing, which reads as "not provisioned yet",
+    # and once enforcement is on that machine refuses every command including
+    # the one that would fix it. Mirrors the checks deploy-agent.ps1 runs at
+    # kitting time.
+    $trimmed = $ring.Trim()
+    if (-not $trimmed.StartsWith('[')) { throw 'ring must be a JSON ARRAY' }
+    # Assign FIRST, then wrap. `@($x | ConvertFrom-Json)` looks equivalent and
+    # is not: on Windows PowerShell 5.1 that form collapses the whole array
+    # into ONE element, so a two-key ring counts as one and the duplicate check
+    # below never sees a second entry. Measured: 5.1 gives 1, pwsh 7 gives 2.
+    $parsed  = ConvertFrom-Json -InputObject $trimmed
+    $entries = @($parsed)
+    if ($entries.Count -eq 0) { throw 'ring is empty - that provisions no keys at all' }
+    foreach ($e in $entries) {
+      # Types, not just presence: IsNullOrWhiteSpace coerces, so an unquoted
+      # "kid": 20260728 would pass here and be rejected by the agent's serde
+      # instead - after the ring is already on the fleet.
+      if ($e.kid -isnot [string] -or $e.public_key -isnot [string]) {
+        throw "every entry needs STRING 'kid' and 'public_key' (quote them)"
+      }
+      if ([string]::IsNullOrWhiteSpace($e.kid) -or [string]::IsNullOrWhiteSpace($e.public_key)) {
+        throw "every entry needs a non-empty 'kid' and 'public_key'"
+      }
+      # Shape-check the key rather than hunting for a known placeholder
+      # string: an Ed25519 public key is 32 bytes, which is exactly 44 base64
+      # characters ending in '='. This rejects an unsubstituted template value,
+      # a pasted kid, a truncated copy, and a private key that wandered into
+      # the wrong field - none of which a "did someone forget to fill this in"
+      # check would have covered.
+      if ($e.public_key -notmatch '^[A-Za-z0-9+/]{43}=$') {
+        throw "entry '$($e.kid)' has a public_key that is not a 32-byte base64 Ed25519 key: $($e.public_key)"
+      }
+      if ($null -ne $e.max_age_secs -and $e.max_age_secs -le 0) {
+        throw "entry '$($e.kid)' has max_age_secs = $($e.max_age_secs); a non-positive window rejects every signature made with the key"
+      }
+    }
+    # A repeat would have one entry silently replace the other in the agent's
+    # ring (it is keyed by id) and every command signed by the loser would stop
+    # verifying with nothing to explain it.
+    $dupes = @($entries | Group-Object -Property kid | Where-Object { $_.Count -gt 1 })
+    if ($dupes.Count) { throw "duplicate key ids: $($dupes.Name -join ', ')" }
+
+    # ---- write -------------------------------------------------------------
+    $subkey = 'SOFTWARE\kanade\agent'
+    # Open, never create. Registry ACLs are per-key, and deploy-agent.ps1 is
+    # what hardens this one to SYSTEM + Administrators. A key created here
+    # would carry no such ACL, and this value is the trust root for every
+    # command the machine will accept - a world-writable one is worse than
+    # none. A missing key means the host was never deployed properly.
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subkey, $true)
+    if (-not $key) {
+      throw "HKLM\$subkey is not present - refusing to create it. Deploy this host first."
+    }
+    try {
+      $key.SetValue('CommandKeys', $trimmed, [Microsoft.Win32.RegistryValueKind]::String)
+    } finally {
+      $key.Close()
+    }
+
+    # ---- read back ---------------------------------------------------------
+    # Report what the machine actually holds, not what we intended to write; a
+    # result that echoes its input proves nothing. The agent picks this up
+    # WITHOUT a restart (the agent reloads the ring when a command names a
+    # key it lacks), so the next signed command verifies.
+    $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subkey)
+    try { $written = $rk.GetValue('CommandKeys') } finally { $rk.Close() }
+    $readBack = ConvertFrom-Json -InputObject $written
+    $kids = @($readBack) | ForEach-Object { $_.kid }
+    Write-Output "CommandKeys provisioned. kids: $($kids -join ', ')"

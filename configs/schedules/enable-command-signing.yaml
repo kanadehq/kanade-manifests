@@ -1,0 +1,75 @@
+# Enable signature enforcement, one ready machine at a time. This is the last
+# step of the rollout: distribute the keyring, confirm coverage, then enforce.
+#
+#   kanade job create      configs/jobs/enable-command-signing.yaml
+#   kanade schedule create configs/schedules/enable-command-signing.yaml
+#
+# ## Ships DISABLED
+#
+# `enabled: false` is the point of this file existing ahead of the flip: the
+# whole apparatus can be reviewed, applied and inspected while it does
+# nothing. Turning it on is then a single, deliberate edit with a diff — not a
+# command someone composes under pressure.
+#
+# Before enabling:
+#   1. `provision-command-keys` has run and coverage looks complete
+#      (`GET /api/agents` reports `command_keys` per host).
+#   2. The `command-signing-ready` group is populated and its size matches
+#      what you expect. An unexpectedly SMALL group is the signal to stop —
+#      it means machines are not reporting `command_signature_ok`, and
+#      enforcing on the rest hides that.
+#   3. Break-glass has been rehearsed at least once, because
+#      the first real use should not be the first use.
+#
+# ## Why target the group rather than `all: true`
+#
+# Membership requires that the host has REPORTED a successful verification, so
+# a machine whose ring is missing, stale or subtly wrong is simply not a
+# member and never receives this. That turns "confirm coverage before
+# flipping" from a checklist into a property of the dispatch.
+#
+# Machines that are offline are not members either — they rejoin when they
+# come back and report `ok`, and the schedule picks them up then. Nothing
+# needs to remember them.
+#
+# ## per_pc: once_per_version
+#
+# Each machine enables once per version of the enable job. Bumping that job's
+# version re-arms the fleet, which is what you want if the expected kids
+# change — the same machine may need to be re-checked against a new ring.
+id: enable-command-signing
+tags: [security, signing]
+enabled: false
+job_id: enable-command-signing
+target:
+  groups: [command-signing-ready]
+# One key only; `once_per_version` carries no cadence of its own. Each machine
+# enables once per version of the enable job, and bumping that version re-arms
+# the fleet — which is what you want when the expected kids change, since the
+# same machine needs re-checking against a new ring.
+when:
+  per_pc: once_per_version
+# Spread the writes. Nothing here is load-bearing on timing, and a fleet-wide
+# simultaneous flip removes the window in which someone notices the first few
+# going wrong.
+#
+# Kept under the 1-minute scheduler poll so `max_concurrent` below stays
+# honest — see the note there. Jitter is no longer what does the spreading.
+jitter: 30s
+constraints:
+  # Deliberately a quarter of the distribution job's rate. Writing a ring is
+  # reversible by writing another one; this is the step that ends with machines
+  # refusing commands, so it is the one to meter hardest. ~50/minute is ~60
+  # minutes to cover 3000.
+  #
+  # Same mechanism and same caveats as provision-command-keys: an explicit pc
+  # list rather than a broadcast, a rolling window refilled each 1-minute tick,
+  # an in-flight count that lags if jitter exceeds the poll, and a fail-open
+  # count on DB error.
+  #
+  # Worth knowing what this does NOT pace: enforcement does not begin when this
+  # job runs. The agent resolves RequireSignedCommands once at startup, so each
+  # machine starts enforcing at its next agent restart — days, spread by
+  # reboots rather than by anything here. This meters the WRITES; nothing today
+  # meters or even observes the flips.
+  max_concurrent: 50

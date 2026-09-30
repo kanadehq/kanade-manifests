@@ -20,6 +20,11 @@ kanade schedule create configs/schedules/check-disk-space.yaml
 kanade exec check-disk-space --pcs <pc-id>
 ```
 
+The command-signing manifests are the exception — they carry
+placeholders and must go through
+[`scripts/rotate-command-keys.ps1`](scripts/rotate-command-keys.ps1)
+first; see [Command signing (rollout)](#command-signing-rollout).
+
 None of this is infrastructure kanade itself depends on — that lives
 in [`configs/jobs/installers/`](https://github.com/kanadehq/kanade/tree/main/configs/jobs/installers)
 in the main repo. Everything below is operator-authored example
@@ -36,6 +41,7 @@ configs/
 ├── schedules/    — cron/interval wiring for a job (when + who + rollout)
 ├── views/        — SQL-backed Analytics dashboards over job output
 └── groups/       — fleet-targeting group definitions (query / members)
+scripts/          — operator helper scripts (placeholder fill-in for signed manifests)
 ```
 
 A job and its schedule share an `id` (e.g. `check-disk-space.yaml` in
@@ -150,6 +156,30 @@ these are meant to be copied and adapted.
 | [`show-toast`](configs/jobs/show-toast.yaml) | [`morning-greeting`](configs/schedules/morning-greeting.yaml) | Good-morning toast to the logged-in user |
 | [`example-power-plan`](configs/jobs/example-power-plan.yaml) | — | Switch the active power plan to High performance, opt-in setting pattern |
 | [`example-show-when/`](configs/jobs/example-show-when/) | — | `detect-myapp-version` + `update-myapp` pair demonstrating `show_when:` (only offer the update job when the detector says it's needed) |
+
+## Command signing (rollout)
+
+**These manifests carry `REPLACE-...` placeholders (public keys, key ids,
+the backend fingerprint) that must be filled in through
+[`scripts/rotate-command-keys.ps1`](scripts/rotate-command-keys.ps1) before
+you apply them — never apply the files as-is. Applying
+`enable-command-signing` with a wrong keyring makes hosts refuse every
+command, including the one that would fix it. Roll out in order:
+distribute the keyring, confirm coverage (the `command-signing-ready` group
+and `command_keys` from `GET /api/agents`), and enforce last. The agent reads
+its enforcement flag at startup, so enforcement begins at each machine's next
+agent restart, not when the job runs.**
+
+The keyring array is replaced, not merged: every revision must list every
+key the fleet should trust. The rotate script fills the placeholders into
+temporary copies, so no fleet-specific value is committed here.
+
+| Manifest | Schedule | Description |
+|---|---|---|
+| [`provision-command-keys`](configs/jobs/provision-command-keys.yaml) | [✓](configs/schedules/provision-command-keys.yaml) | Distribute the command-signing public keyring (backend + break-glass) to every agent, once per version |
+| [`enable-command-signing`](configs/jobs/enable-command-signing.yaml) | [✓](configs/schedules/enable-command-signing.yaml) | Turn signature enforcement on, one ready machine at a time — **ships `enabled: false`** |
+| [`command-signing-ready`](configs/groups/command-signing-ready.yaml) | — | Group of machines that reported a successful verification and hold the current backend key — the only safe targets for enforcement |
+| [`rotate-command-keys.ps1`](scripts/rotate-command-keys.ps1) | — | Fills the placeholders into temp copies and applies them in order; dry-run by default |
 
 ## Fleet targeting (groups)
 

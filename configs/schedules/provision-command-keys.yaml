@@ -1,0 +1,70 @@
+# Carry the command-signing keyring to every machine, including
+# the ones that are offline right now.
+#
+#   kanade job create      configs/jobs/provision-command-keys.yaml
+#   kanade schedule create configs/schedules/provision-command-keys.yaml
+#
+# ## Why a schedule and not a one-shot exec
+#
+# A `kanade exec` reaches the machines that are online at that instant. At
+# ~500 endpoints there are always some asleep, off, or off-site, and a
+# one-shot leaves them behind silently — which is the state that turns into a
+# refused-everything endpoint the day enforcement goes on. A schedule keeps
+# trying until each machine has actually applied the current ring.
+#
+# ## per_pc: once_per_version, not `once`
+#
+# `once` means "succeeded ever ⇒ never again", which is right for kitting and
+# wrong for a keyring: a rotation would never reach anyone. `once_per_version`
+# scopes the "already done" memory to the job's `version`, so bumping the
+# version in the job manifest is what re-arms the whole fleet — exactly one
+# application of each ring revision per machine, with no re-runs in between.
+#
+# ## This works BECAUSE nothing is enforced yet
+#
+# Distribution rides the command plane, so it only functions while agents
+# still accept unsigned (or not-yet-verifiable) commands. That is the ordering
+# constraint behind the whole rollout: distribute first, confirm coverage,
+# enforce last. Enforcing first would make this schedule unable to reach the
+# machines that need it most.
+id: provision-command-keys
+tags: [security, signing]
+enabled: true
+job_id: provision-command-keys
+target:
+  all: true
+# `when` takes exactly one key. `once_per_version` carries no cadence of its
+# own — it lowers to "fire on every scheduler tick, skip any PC that already
+# succeeded at this job version" — which is what makes it the right shape
+# here: a machine that was off simply catches up on the tick after it wakes,
+# and one that already applied this ring revision does no work at all.
+when:
+  per_pc: once_per_version
+# Backend-driven (the default) rather than runs_on: agent. An agent-side tick
+# fires from cached job state, and this job's whole purpose is to deliver a
+# NEW value — the agent cannot schedule a revision it has not been told about.
+#
+# `jitter` alone does NOT bound the dispatch. `once_per_version` fires through
+# FireAction::FirePcs, so the plan's target becomes an explicit pc list — at
+# ~3000 endpoints that is 3000 command publishes in one burst, and jitter only
+# staggers when each agent starts running what it already received.
+# `max_concurrent` is what meters the dispatch itself.
+jitter: 30s
+constraints:
+  # Backend-only, and this schedule is backend-driven, so it applies. The
+  # scheduler counts still-in-flight runs of this job each tick and fires at
+  # only that many remaining pcs; the rest wait for the next 1-minute tick.
+  # Effective rate is therefore ~200 machines/minute — ~15 minutes to cover
+  # 3000, instead of one burst.
+  #
+  # Paired with a SHORT jitter on purpose. The in-flight count comes from
+  # `execution_results.finished_at IS NULL`, and a just-dispatched run has not
+  # landed a started row yet — so a jitter longer than the 1-minute poll makes
+  # the count lag and the cap over-shoot. Under a minute the
+  # run lands before the next tick and the cap holds. The old 5m jitter would
+  # have quietly defeated this.
+  #
+  # Not a hard guarantee either way: a failed count reads as 0 in-flight and
+  # fails OPEN, on the reasoning that over-dispatching beats wedging a capped
+  # job shut on a transient DB error. Treat it as smoothing, not a limit.
+  max_concurrent: 200

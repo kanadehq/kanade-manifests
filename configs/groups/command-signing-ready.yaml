@@ -1,0 +1,108 @@
+# Machines that are SAFE to switch signature enforcement on.
+#
+#   kanade group def create configs/groups/command-signing-ready.yaml
+#
+# ## Why a group and not a checklist
+#
+# Enforcement must not be turned on for a machine whose ring does not work —
+# it would refuse every command, including the one that would fix it. That
+# precondition used to be a human reading a dashboard before flipping. Making
+# it a group means the dispatch itself honours it: a machine that is not ready
+# simply is not a member, so the enable job never reaches it.
+#
+# ## Two conditions, and neither substitutes for the other
+#
+# 1. **It reported `command_signature_ok`** — its most recent signing-state
+#    transition is a success. This is the only evidence that verification
+#    actually SUCCEEDS end to end: the key material, the clock, the header
+#    handling, the whole path. Matching key bytes do not imply a passing
+#    verification — a host with a skewed clock reports `Stale` while holding
+#    exactly the right key.
+#
+# 2. **It lists the current BACKEND key** — `kid:fingerprint`, not the kid
+#    alone. The kid is chosen by whoever wrote the ring, so it
+#    proves currency and nothing else; the fingerprint proves the bytes are the
+#    ones the backend signs with. Mistype one character of a public key and you
+#    get the correct kid with the wrong key: every command comes back
+#    `Invalid`, and because the key *is* present the reload-on-unknown-key path
+#    never fires.
+#
+# Neither condition subsumes the other, and the case that proves it is a
+# mistyped `-BackendPublicKey`: the rotate script would write that key to the
+# ring AND derive the group's fingerprint literal from the same mistake, so
+# condition 2 agrees with itself and passes. Condition 1 is what fails, because
+# the backend signs with the real key. Conversely a clock-skewed host satisfies
+# 2 and fails 1. Local consistency and end-to-end correctness are different
+# questions, and the group asks both.
+#
+# ## Why break-glass is NOT checked here
+#
+# It COULD be, now. This condition was removed because `command_keys` used to
+# report only keys that had entered memory — and break-glass is by definition
+# unused in normal operation, so requiring it left this group permanently EMPTY
+# and the enable job reaching nobody, silently, while looking like it had
+# worked. Measured on the dev host: a two-key ring sat on disk while
+# `command_keys` reported one for minutes, and only flipped once a break-glass
+# command actually arrived. That has since been fixed — the ring is refreshed from
+# the store on every heartbeat, and a from-zero rehearsal on the dev host
+# confirmed break-glass now appears within one interval of being provisioned.
+#
+# It stays out because it would be redundant, not because it would be wrong.
+# The enable job reads the REGISTRY, which is the stronger check for "was this
+# provisioned": memory answers "would this machine accept a command right now",
+# disk answers "does it hold the ring we sent", and provisioning is a question
+# about disk. Asking it twice buys nothing and gives a rotation two places to
+# forget.
+#
+# It is also safe for break-glass to be absent from memory: when enforcement is enabled the
+# agent forces a keyring reload before refusing, so the first break-glass
+# command picks the key up. Being on disk is the requirement, not being loaded.
+#
+# ## Placeholders
+#
+# The kid and fingerprint literals must match the ring in
+# `configs/jobs/provision-command-keys.yaml`, and must be updated in the same
+# commit as a rotation — otherwise this group empties out and the enable job
+# quietly reaches nobody. `scripts/rotate-command-keys.ps1` substitutes both,
+# deriving the fingerprint from the public key rather than taking it as a
+# separate input, so the two cannot disagree.
+id: command-signing-ready
+description: >-
+  Hosts whose latest command-signature outcome is OK and whose keyring lists
+  the current backend key by id AND fingerprint. Membership is the precondition
+  for enabling signature enforcement.
+tags: [security, signing]
+# Recomputed often: this gates an operator action, and a stale membership
+# either delays a safe host or — worse — keeps a host that has since fallen
+# out of `ok` looking eligible.
+refresh: 10m
+query: |
+  WITH latest AS (
+    SELECT pc_id,
+           kind,
+           ROW_NUMBER() OVER (PARTITION BY pc_id ORDER BY at DESC, id DESC) AS rn
+    FROM obs_events
+    WHERE source = 'command_signature'
+  )
+  SELECT a.pc_id
+  FROM agents a
+  JOIN latest l ON l.pc_id = a.pc_id AND l.rn = 1
+  WHERE l.kind = 'command_signature_ok'
+    AND a.command_keys IS NOT NULL
+    -- Matched with the surrounding quotes on purpose. `command_keys` is a JSON
+    -- array of `kid:fingerprint` STRINGS, so `"<kid>:<fp>"` appears verbatim,
+    -- and the closing quote is what stops a prefix collision: `%"backend-1"%`
+    -- does NOT match `["backend-10"]`. Verified against the live projector DB.
+    --
+    -- Pinning the fingerprint too is what makes this a check on
+    -- the KEY rather than on the name someone gave it. Drop the `:<fp>` half
+    -- and a host holding the right id with wrong bytes is indistinguishable
+    -- from a correct one — while refusing every command once enforcement is on.
+    --
+    -- LIKE rather than json_each: this query runs through the read-only query
+    -- path, which rejects table-valued functions ("no such table column:
+    -- json_each.key") even on SQLite 3.51 where json_each exists. json_extract
+    -- works, but an array of unknown length cannot be indexed positionally.
+    -- That constraint is also why the agent reports one flat string instead of
+    -- an object: there would be no way to query the pair otherwise.
+    AND a.command_keys LIKE '%"REPLACE-backend-kid:REPLACE-backend-fingerprint"%'
