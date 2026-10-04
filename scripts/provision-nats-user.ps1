@@ -33,7 +33,8 @@
 
 .PARAMETER JobVersion
   Version stamped on the provisioning job. MUST differ from the version
-  committed in the manifest, and must be bumped whenever the credential
+  committed in the manifest and higher than the last version applied from this
+  machine (recorded after a successful apply), and must be bumped whenever the credential
   changes: the schedule uses `per_pc: once_per_version`, so the version is what
   re-arms the fleet. Reusing it means the new value reaches nobody who already
   applied the old one, silently.
@@ -79,6 +80,19 @@ if (-not (Test-Path $jobSrc)) { throw "missing manifest: $jobSrc" }
 $committed = [regex]::Match((Get-Content -LiteralPath $jobSrc -Raw), '(?m)^version:\s*(\S+)').Groups[1].Value
 if ($JobVersion -eq $committed) {
     throw "-JobVersion $JobVersion is the version already in the manifest. Bump it: the schedule reaches nobody who applied that version."
+}
+if ([version]$JobVersion -lt [version]$committed) { throw "-JobVersion $JobVersion is older than the manifest's $committed." }
+# The manifest never records what was last APPLIED, so remember it locally: a
+# second credential change under the same version would otherwise pass the
+# check above and reach nobody who already ran the first. This only sees
+# applies made from this machine and account; from elsewhere, check the
+# registered job's version yourself.
+$stateFile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'kanade\nats-user-last-version.txt'
+if (Test-Path $stateFile) {
+    $last = (Get-Content -LiteralPath $stateFile -Raw).Trim()
+    if ($last -match '^\d+\.\d+\.\d+$' -and [version]$JobVersion -le [version]$last) {
+        throw "-JobVersion $JobVersion was already applied from this machine (last: $last). Use a higher version: the schedule reaches nobody who applied it."
+    }
 }
 
 # ---- collect the credential without echoing it -----------------------------
@@ -192,7 +206,14 @@ try {
         switch ($r.Kind) {
             'job'      { Invoke-Kanade @('job', 'create', $r.Path) }
             'group'    { Invoke-Kanade @('group', 'def', 'create', $r.Path) }
-            'schedule' { Invoke-Kanade @('schedule', 'create', $r.Path) }
+            'schedule' {
+                Invoke-Kanade @('schedule', 'create', $r.Path)
+                if ($Apply -and $r.Path -like '*schedule-provision-nats-user.yaml') {
+                    # From here machines can run this version: never accept it again.
+                    New-Item -ItemType Directory -Force -Path (Split-Path $stateFile) | Out-Null
+                    Set-Content -LiteralPath $stateFile -Value $JobVersion
+                }
+            }
             default    { throw "unknown manifest kind '$($r.Kind)' for $($r.Name)" }
         }
     }

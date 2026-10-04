@@ -21,9 +21,14 @@
 # Writes go user then password, and a failure in between puts the first one
 # back (or deletes it if it did not exist). A read-back then confirms what the
 # machine actually holds. One thing remains out of reach: killing the process
-# between the two writes leaves a half-written pair. That state is not hidden -
-# check-nats-user reports a lone value as not present - and the next run
-# repairs it, because only a pair that already matches counts as unchanged.
+# between the two writes leaves a half-written pair: a lone value (reported as
+# not present by check-nats-user) or, when replacing, a new user beside the old
+# password (which the check cannot tell from a good pair - it sees presence
+# only). Two registry values cannot be made atomic without registry
+# transactions, which Windows PowerShell 5.1 cannot use safely. The killed run
+# is a FAILED run, so once_per_version retries it and the next run rewrites the
+# pair, because only a pair that already matches counts as unchanged. Watch for
+# failed provision runs, not only for the check.
 #
 # ## Placeholders
 #
@@ -39,8 +44,8 @@
 # The agent's key is hardened by the agent deploy script to SYSTEM and
 # Administrators only. This job opens that key and never creates it (a created
 # key would have no such ACL). Before writing it checks the ACL by SID and, only
-# if some other principal holds an allow rule, tightens it to the same
-# protected SYSTEM + Administrators form. A stricter existing ACL is left alone.
+# if some other principal holds an allow rule, cuts inheritance and removes
+# just those allow rules. Narrower existing grants and deny rules are kept.
 #
 # ## Output
 #
@@ -101,21 +106,22 @@ execute:
           $_.IdentityReference -ne $systemSid -and $_.IdentityReference -ne $adminSid
         })
       if ($others.Count -gt 0) {
-        # Keep inherited rules as explicit ones first so SYSTEM and
-        # Administrators do not lose access when inheritance is cut, then drop
-        # every other principal. Only ever narrows.
+        # Cut inheritance but keep the inherited rules as explicit ones, so
+        # nothing already granted to SYSTEM or Administrators is lost, then
+        # re-read and remove ONLY the allow rules of every other principal.
+        # Existing narrower grants for SYSTEM / Administrators and any deny
+        # rules are left exactly as they are: this only ever narrows. (This
+        # process already holds FullControl on the key, so SYSTEM needs no
+        # extra grant to finish the write.)
         $acl.SetAccessRuleProtection($true, $true)
-        foreach ($sid in @($others | ForEach-Object { $_.IdentityReference } | Select-Object -Unique)) {
-          $acl.PurgeAccessRules($sid)
-        }
-        foreach ($sid in @($systemSid, $adminSid)) {
-          $acl.SetAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
-            $sid,
-            [System.Security.AccessControl.RegistryRights]::FullControl,
-            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit',
-            [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow)))
-        }
+        $key.SetAccessControl($acl)
+        $acl = $key.GetAccessControl()
+        $others = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+          Where-Object {
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            $_.IdentityReference -ne $systemSid -and $_.IdentityReference -ne $adminSid
+          })
+        foreach ($rule in $others) { [void]$acl.RemoveAccessRuleSpecific($rule) }
         $key.SetAccessControl($acl)
       }
 
