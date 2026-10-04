@@ -159,7 +159,8 @@ these are meant to be copied and adapted.
 | [`kitting-setup`](configs/jobs/kitting-setup.yaml) | [`kitting-once`](configs/schedules/kitting-once.yaml) | First-boot setup pipeline sketch (`per_pc: once`), no real side effects |
 | [`show-toast`](configs/jobs/show-toast.yaml) | [`morning-greeting`](configs/schedules/morning-greeting.yaml) | Good-morning toast to the logged-in user |
 | [`example-power-plan`](configs/jobs/example-power-plan.yaml) | — | Switch the active power plan to High performance, opt-in setting pattern |
-| [`example-show-when/`](configs/jobs/example-show-when/) | — | `detect-myapp-version` + `update-myapp` pair demonstrating `show_when:` (only offer the update job when the detector says it's needed) |
+| [`detect-myapp-version`](configs/jobs/example-show-when/detect-myapp-version.yaml) | [✓](configs/jobs/example-show-when/detect-myapp-version.schedule.yaml) | `show_when:` example, part 1: the detector job (`myapp-up-to-date`) |
+| [`update-myapp`](configs/jobs/example-show-when/update-myapp.yaml) | — | `show_when:` example, part 2: only offered when the detector says the update is needed |
 
 ## Command signing (rollout)
 
@@ -272,6 +273,18 @@ Adding a manifest? Keep the category tables above in sync, and lead
 the file with a comment block explaining what it does and any
 opt-in/disruptive caveats — every existing file follows that
 convention. PRs welcome.
+
+Every pull request runs the `validate` check, which runs the `kanade`
+`job` / `schedule` / `view` / `group def` `validate` commands over `configs/`,
+checks that each schedule's `job_id` exists, that README links resolve and
+every manifest is linked from the tables above, and parses the PowerShell in
+`scripts/` and in job bodies for syntax errors. New manifests must pass it.
+`REPLACE-...` placeholders are fine. To run the same checks locally (needs the
+`kanade` CLI and `pwsh` on `PATH`):
+
+```powershell
+pwsh scripts/validate.ps1
+```
 
 ## License
 

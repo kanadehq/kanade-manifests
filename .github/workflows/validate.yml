@@ -1,0 +1,76 @@
+name: Validate
+
+# One job, no path filters: a required check that a filter skips never
+# reports, and would block merging forever. The job name below is what the
+# repository requires, so keep it stable.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KANADE_REPO: kanadehq/kanade
+      KANADE_ASSET: kanade-x86_64-unknown-linux-musl.tar.gz
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install kanade CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=kanade CLI install failed::$*"; exit 1; }
+
+          release=$(gh release view --repo "$KANADE_REPO" --json tagName,assets) \
+            || fail "cannot read the latest release of $KANADE_REPO"
+          tag=$(jq -r .tagName <<<"$release")
+          echo "Latest release: $tag, asset: $KANADE_ASSET"
+
+          dir="$RUNNER_TEMP/kanade-dl"
+          mkdir -p "$dir"
+          gh release download "$tag" --repo "$KANADE_REPO" \
+              --pattern "$KANADE_ASSET" --dir "$dir" \
+            || fail "cannot download $KANADE_ASSET from $KANADE_REPO $tag"
+          [ -s "$dir/$KANADE_ASSET" ] \
+            || fail "$KANADE_ASSET from $KANADE_REPO $tag is missing or empty"
+
+          # Prefer a published checksum asset, then the digest GitHub records
+          # for the asset. Only when neither exists is the download unverified.
+          sumfile=$(jq -r --arg a "$KANADE_ASSET" \
+            '[.assets[].name | select(. == ($a + ".sha256") or . == "SHA256SUMS")][0] // empty' <<<"$release")
+          digest=$(jq -r --arg a "$KANADE_ASSET" \
+            '.assets[] | select(.name == $a) | .digest // empty' <<<"$release")
+          if [ -n "$sumfile" ]; then
+            gh release download "$tag" --repo "$KANADE_REPO" --pattern "$sumfile" --dir "$dir" \
+              || fail "cannot download checksum file $sumfile from $KANADE_REPO $tag"
+            (cd "$dir" && grep -F "$KANADE_ASSET" "$sumfile" | sha256sum -c -) \
+              || fail "checksum mismatch for $KANADE_ASSET ($sumfile)"
+          elif [ "${digest#sha256:}" != "$digest" ]; then
+            echo "${digest#sha256:}  $dir/$KANADE_ASSET" | sha256sum -c - \
+              || fail "checksum mismatch for $KANADE_ASSET (release digest)"
+          else
+            echo "::notice::No checksum published for $KANADE_ASSET in $tag; download is unverified"
+          fi
+
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$dir/$KANADE_ASSET" -C "$dir"
+          install -m 0755 "$dir/${KANADE_ASSET%.tar.gz}" "$HOME/.local/bin/kanade" \
+            || fail "$KANADE_ASSET did not contain ${KANADE_ASSET%.tar.gz}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/kanade" --version
+
+      - name: Validate manifests and scripts
+        shell: pwsh
+        run: ./scripts/validate.ps1
