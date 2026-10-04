@@ -85,7 +85,7 @@ function Get-ExecuteInfo([string]$Path) {
   if ($start -lt 0) { $info.Error = 'no top-level execute: block'; return $info }
   $i = $start + 1
   while ($i -lt $lines.Count -and ($lines[$i] -match '^\s' -or $lines[$i] -match '^\s*(#.*)?$')) {
-    if ($lines[$i] -match '^  shell\s*:\s*(\S+)') { $info.Shell = $Matches[1] }
+    if ($lines[$i] -match '^  shell\s*:\s*(.*?)\s*(#.*)?$') { $info.Shell = $Matches[1].Trim('"', "'") }
     if ($lines[$i] -match '^  script\s*:\s*(.*?)\s*$') {
       if ($Matches[1] -notmatch '^\|[-+]?$') { $info.Error = "execute.script is not a '|' block ($($Matches[1]))"; return $info }
       $body = [System.Collections.Generic.List[string]]::new()
@@ -96,10 +96,12 @@ function Get-ExecuteInfo([string]$Path) {
       }
       $indent = ($body | Where-Object { $_.Trim() } | ForEach-Object { $_.Length - $_.TrimStart().Length } | Measure-Object -Minimum).Minimum
       $info.Body = ($body | ForEach-Object { if ($_.Length -ge $indent) { $_.Substring($indent) } else { '' } }) -join "`n"
-      return $info
+      $i = $j
+      continue  # keep scanning: shell: may come after script:
     }
     $i++
   }
+  if ($null -ne $info.Body) { return $info }
   $info.Error = 'execute: has no script: (script_file: and other forms are not supported by this check)'
   $info
 }
