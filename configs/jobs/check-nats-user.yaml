@@ -28,7 +28,8 @@
 # projection, so progress goes to stderr.
 #
 # status: ok = both values present and non-empty; fail = key absent, a value
-# missing or empty (including a lone half of the pair); unknown = the check
+# missing or empty (including a lone half of the pair) or the provision job's
+# pending marker is set (a write was interrupted); unknown = the check
 # itself errored.
 id: check-nats-user
 version: 0.1.0
@@ -50,10 +51,12 @@ execute:
         try {
           $u = $key.GetValue('NatsUser', $null)
           $p = $key.GetValue('NatsPassword', $null)
+          $pending = $null -ne $key.GetValue('NatsProvisionPending', $null)
         } finally { $key.Close() }
         $uOk = ($u -is [string]) -and -not [string]::IsNullOrWhiteSpace($u)
         $pOk = ($p -is [string]) -and -not [string]::IsNullOrWhiteSpace($p)
-        if ($uOk -and $pOk)      { $status = 'ok';   $detail = 'user and password present'; $present = $true }
+        if ($pending)            { $status = 'fail'; $detail = 'provisioning was interrupted; waiting for a retry' }
+        elseif ($uOk -and $pOk)  { $status = 'ok';   $detail = 'user and password present'; $present = $true }
         elseif ($uOk -or $pOk)   { $status = 'fail'; $detail = 'only one of user and password present' }
         else                     { $status = 'fail'; $detail = 'user and password not present' }
       }

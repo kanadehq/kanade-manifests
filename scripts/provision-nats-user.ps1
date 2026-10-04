@@ -34,10 +34,14 @@
 .PARAMETER JobVersion
   Version stamped on the provisioning job. MUST differ from the version
   committed in the manifest and higher than the last version applied from this
-  machine (recorded after a successful apply), and must be bumped whenever the credential
+  machine (recorded when an apply starts), and must be bumped whenever the credential
   changes: the schedule uses `per_pc: once_per_version`, so the version is what
   re-arms the fleet. Reusing it means the new value reaches nobody who already
   applied the old one, silently.
+
+.PARAMETER ConfirmVersionBumped
+  Required with -Apply on a machine with no record of earlier applies: states
+  that you checked the registered job's version and -JobVersion is higher.
 
 .PARAMETER Apply
   Actually run the `kanade` commands. Without it the script prints what it
@@ -60,6 +64,7 @@ param(
     [Parameter(Mandatory)][string]$JobVersion,
     [string]$Server = '',
     [string]$BackendUrl = '',
+    [switch]$ConfirmVersionBumped,
     [switch]$Apply
 )
 
@@ -88,6 +93,9 @@ if ([version]$JobVersion -lt [version]$committed) { throw "-JobVersion $JobVersi
 # applies made from this machine and account; from elsewhere, check the
 # registered job's version yourself.
 $stateFile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'kanade\nats-user-last-version.txt'
+if (-not (Test-Path $stateFile) -and $Apply -and -not $ConfirmVersionBumped) {
+    throw "no record of earlier applies from this machine. Check the version the registered provision-nats-user job carries, make sure -JobVersion is higher, and re-run with -ConfirmVersionBumped."
+}
 if (Test-Path $stateFile) {
     $last = (Get-Content -LiteralPath $stateFile -Raw).Trim()
     if ($last -match '^\d+\.\d+\.\d+$' -and [version]$JobVersion -le [version]$last) {
@@ -202,18 +210,18 @@ try {
     }
 
     Write-Host '--- apply ---'
+    if ($Apply) {
+        # Burn the version BEFORE the first create: once the job is registered
+        # under it and the schedule is enabled, machines may run it, and a
+        # failure part-way must not let the same version be reused.
+        New-Item -ItemType Directory -Force -Path (Split-Path $stateFile) | Out-Null
+        Set-Content -LiteralPath $stateFile -Value $JobVersion
+    }
     foreach ($r in $rendered) {
         switch ($r.Kind) {
             'job'      { Invoke-Kanade @('job', 'create', $r.Path) }
             'group'    { Invoke-Kanade @('group', 'def', 'create', $r.Path) }
-            'schedule' {
-                Invoke-Kanade @('schedule', 'create', $r.Path)
-                if ($Apply -and $r.Path -like '*schedule-provision-nats-user.yaml') {
-                    # From here machines can run this version: never accept it again.
-                    New-Item -ItemType Directory -Force -Path (Split-Path $stateFile) | Out-Null
-                    Set-Content -LiteralPath $stateFile -Value $JobVersion
-                }
-            }
+            'schedule' { Invoke-Kanade @('schedule', 'create', $r.Path) }
             default    { throw "unknown manifest kind '$($r.Kind)' for $($r.Name)" }
         }
     }

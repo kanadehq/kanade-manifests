@@ -240,7 +240,7 @@ Warnings:
   are Windows-only, and those machines are not in the not-ready list.
 - **Changing the credential means bumping the job version**, or machines that
   already applied the old one never receive it, and the check keeps reporting
-  them ready. The script refuses the committed version and any version at or below the one it last applied from the same machine.
+  them ready. The script refuses the committed version and any version at or below the one it last applied from the same machine; on a machine with no such record, `-Apply` needs `-ConfirmVersionBumped`, meaning you checked the registered job's version.
 - **Presence is not correctness.** A mistyped password passes the check and
   is locked out at the switch. Keep the switch revertible and watch which
   machines disappear afterwards.

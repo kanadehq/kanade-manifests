@@ -20,15 +20,15 @@
 #
 # Writes go user then password, and a failure in between puts the first one
 # back (or deletes it if it did not exist). A read-back then confirms what the
-# machine actually holds. One thing remains out of reach: killing the process
-# between the two writes leaves a half-written pair: a lone value (reported as
-# not present by check-nats-user) or, when replacing, a new user beside the old
-# password (which the check cannot tell from a good pair - it sees presence
-# only). Two registry values cannot be made atomic without registry
-# transactions, which Windows PowerShell 5.1 cannot use safely. The killed run
-# is a FAILED run, so once_per_version retries it and the next run rewrites the
-# pair, because only a pair that already matches counts as unchanged. Watch for
-# failed provision runs, not only for the check.
+# machine actually holds. Two registry values cannot be written atomically
+# (registry transactions are not usable from Windows PowerShell 5.1), so a
+# killed process is covered differently: before the first write the job sets a
+# non-secret marker value, `NatsProvisionPending`, and removes it only after the
+# read-back succeeds. check-nats-user reports a machine with the marker as not
+# ready, so an interrupted write (a lone value, or a new user beside the old
+# password) can never look ok. The killed run is a FAILED run, which
+# once_per_version retries; the rewrite then clears the marker. The agent
+# ignores the marker.
 #
 # ## Placeholders
 #
@@ -130,6 +130,9 @@ execute:
       $oldPass = $key.GetValue('NatsPassword', $null)
       if (($oldUser -is [string]) -and ($oldPass -is [string]) -and
           ($oldUser -ceq $natsUser) -and ($oldPass -ceq $natsPass)) {
+        # A matching pair with a leftover marker is a run that died after the
+        # writes; the pair is verified above, so just clear the marker.
+        $key.DeleteValue('NatsProvisionPending', $false)
         Write-Output 'unchanged'
         return
       }
@@ -143,16 +146,21 @@ execute:
       # ---- write: user, then password; roll back on any failure -------------
       $str = [Microsoft.Win32.RegistryValueKind]::String
       try {
+        $key.SetValue('NatsProvisionPending', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
         $key.SetValue('NatsUser', $natsUser, $str)
         $key.SetValue('NatsPassword', $natsPass, $str)
         if (($key.GetValue('NatsUser', $null) -cne $natsUser) -or
             ($key.GetValue('NatsPassword', $null) -cne $natsPass)) {
           throw 'read-back mismatch'
         }
+        $key.DeleteValue('NatsProvisionPending', $false)
       } catch {
+        # The marker is left in place if the restore itself fails, so the
+        # machine still reads as not ready.
         try {
           Restore-Value 'NatsUser' $oldUser
           Restore-Value 'NatsPassword' $oldPass
+          $key.DeleteValue('NatsProvisionPending', $false)
         } catch { }
         throw 'writing the NATS credential failed; the previous state was restored'
       }
