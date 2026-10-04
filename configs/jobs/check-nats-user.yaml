@@ -1,0 +1,75 @@
+# Operator-defined HEALTH CHECK: does this machine hold the agent role's NATS
+# user and password?
+#
+#   kanade job create      configs/jobs/check-nats-user.yaml
+#   kanade schedule create configs/schedules/check-nats-user.yaml
+#
+# It answers one question before the broker is switched: which machines would
+# be locked out because they never received the pair. It reports presence only:
+# `{"present": true|false}`, a status and a short fixed detail. No length, hash
+# or prefix of either value is emitted, so the result is safe to store and show.
+#
+# ## Presence is not correctness
+#
+# A mistyped password is present, so this check passes it and the machine is
+# locked out at the switch. See the README section "NATS role credentials,
+# before the switch" for how to keep the switch revertible.
+#
+# ## Why SYSTEM
+#
+# The values sit under an ACL that allows only SYSTEM and Administrators. Run
+# in the user session this would read nothing and report every machine as not
+# present - a fleet-wide false negative - so `run_as: system` is required.
+#
+# ## Read-only, and stdout is the contract
+#
+# It never provisions; fixing a machine is the provision job's work. Stdout is
+# exactly one JSON line, because anything else on it silently breaks the
+# projection, so progress goes to stderr.
+#
+# status: ok = both values present and non-empty; fail = key absent, a value
+# missing or empty (including a lone half of the pair) or the provision job's
+# pending marker is set (a write was interrupted); unknown = the check
+# itself errored.
+id: check-nats-user
+version: 0.1.0
+description: NATS role credential present on this machine (presence only, never the value)
+tags: [health-check, security, nats]
+execute:
+  shell: powershell
+  run_as: system
+  timeout: 30s
+  script: |
+    $ErrorActionPreference = 'Stop'
+    $status = 'unknown'; $detail = 'check failed'; $present = $false
+    try {
+      [Console]::Error.WriteLine('check-nats-user: reading HKLM\SOFTWARE\kanade\agent')
+      $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\kanade\agent')
+      if (-not $key) {
+        $status = 'fail'; $detail = 'agent registry key not present'
+      } else {
+        try {
+          $u = $key.GetValue('NatsUser', $null)
+          $p = $key.GetValue('NatsPassword', $null)
+          $pending = $null -ne $key.GetValue('NatsProvisionPending', $null)
+        } finally { $key.Close() }
+        $uOk = ($u -is [string]) -and -not [string]::IsNullOrWhiteSpace($u)
+        $pOk = ($p -is [string]) -and -not [string]::IsNullOrWhiteSpace($p)
+        if ($pending)            { $status = 'fail'; $detail = 'provisioning was interrupted; waiting for a retry' }
+        elseif ($uOk -and $pOk)  { $status = 'ok';   $detail = 'user and password present'; $present = $true }
+        elseif ($uOk -or $pOk)   { $status = 'fail'; $detail = 'only one of user and password present' }
+        else                     { $status = 'fail'; $detail = 'user and password not present' }
+      }
+    } catch {
+      # Fixed wording: never relay exception text from a script that touches a secret.
+      $status = 'unknown'; $detail = 'could not read the registry'; $present = $false
+    }
+    [pscustomobject]@{ status = $status; detail = $detail; present = $present } | ConvertTo-Json -Compress
+check:
+  name: nats_user
+  label: "NATS ロール資格情報"
+inventory:
+  display:
+    - { field: status, label: NATS user }
+    - { field: detail, label: Detail }
+    - { field: present, label: Present }

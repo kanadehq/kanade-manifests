@@ -1,0 +1,170 @@
+# Provision the agent role's NATS user onto every Windows agent.
+#
+# This is the fleet-side half of switching the broker from one shared token to
+# per-role users. It only puts the credential on the machines; the broker is
+# not touched by anything in this repository. Switching it before every agent
+# holds the pair locks the stragglers out.
+#
+#   kanade job create      configs/jobs/provision-nats-user.yaml
+#   kanade schedule create configs/schedules/provision-nats-user.yaml
+#
+# Do not apply these files as they are: use scripts/provision-nats-user.ps1,
+# which fills the placeholders into temporary copies so no secret is committed.
+#
+# ## What it writes
+#
+# `NatsUser` and `NatsPassword` (REG_SZ) under HKLM\SOFTWARE\kanade\agent,
+# both or neither. The existing token value is never read, changed or removed.
+#
+# ## Both values, or neither
+#
+# Writes go user then password, and a failure in between puts the first one
+# back (or deletes it if it did not exist). A read-back then confirms what the
+# machine actually holds. Two registry values cannot be written atomically
+# (registry transactions are not usable from Windows PowerShell 5.1), so a
+# killed process is covered differently: before the first write the job sets a
+# non-secret marker value, `NatsProvisionPending`, and removes it only after the
+# read-back succeeds. check-nats-user reports a machine with the marker as not
+# ready, so an interrupted write (a lone value, or a new user beside the old
+# password) can never look ok. The killed run is a FAILED run, which
+# once_per_version retries; the rewrite then clears the marker. The agent
+# ignores the marker.
+#
+# ## Placeholders
+#
+# The two values below are base64 of the UTF-8 text, not the text itself. A
+# password containing a quote, a dollar sign or a newline would otherwise break
+# the YAML or the PowerShell string, or become code. An unfilled placeholder is
+# not valid base64, so decoding fails before anything is written. Base64 is an
+# encoding, not protection: treat the filled-in copy exactly like the plain
+# password.
+#
+# ## The ACL
+#
+# The agent's key is hardened by the agent deploy script to SYSTEM and
+# Administrators only. This job opens that key and never creates it (a created
+# key would have no such ACL). Before writing it checks the ACL by SID and, only
+# if some other principal holds an allow rule, cuts inheritance and removes
+# just those allow rules. Narrower existing grants and deny rules are kept.
+#
+# ## Output
+#
+# One line: `written` or `unchanged`. Neither value, nor anything derived from
+# them, is ever printed, and error text is fixed wording for the same reason.
+id: provision-nats-user
+tags: [security, nats]
+# Bump on EVERY credential change - the schedule keys "already applied" off this.
+version: 0.1.0
+description: "Provision the agent role's NATS user and password (HKLM, SYSTEM + Administrators only)"
+
+execute:
+  shell: powershell
+  run_as: system
+  timeout: 60s
+  script: |
+    $ErrorActionPreference = 'Stop'
+
+    $userB64 = 'REPLACE-nats-user-b64'
+    $passB64 = 'REPLACE-nats-password-b64'
+
+    # ---- decode and validate BEFORE touching the registry ------------------
+    function ConvertFrom-B64 {
+      param([string]$Value)
+      try {
+        $bytes = [Convert]::FromBase64String($Value)
+        return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+      } catch {
+        throw 'a credential value is not valid base64 UTF-8 - fill the manifest in before applying'
+      }
+    }
+    $natsUser = ConvertFrom-B64 $userB64
+    $natsPass = ConvertFrom-B64 $passB64
+    if ($natsUser -notmatch '^[A-Za-z0-9_.-]{1,128}$') {
+      throw 'NATS user is empty or has characters outside A-Z a-z 0-9 _ . -'
+    }
+    if ([string]::IsNullOrWhiteSpace($natsPass)) { throw 'NATS password is empty' }
+    if ($natsPass.Length -gt 1024)               { throw 'NATS password is implausibly long' }
+    if ($natsPass -match '[\p{Cc}]')             { throw 'NATS password contains a control character' }
+
+    # ---- open the key (never create) ---------------------------------------
+    $subkey = 'SOFTWARE\kanade\agent'
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+      $subkey,
+      [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+      [System.Security.AccessControl.RegistryRights]::FullControl)
+    if (-not $key) {
+      throw "HKLM\$subkey is not present or cannot be opened - refusing to create it. Deploy this host first."
+    }
+    try {
+      # ---- ACL: SYSTEM + Administrators only, checked by SID ----------------
+      $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+      $adminSid  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+      $acl = $key.GetAccessControl()
+      $others = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        Where-Object {
+          $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+          $_.IdentityReference -ne $systemSid -and $_.IdentityReference -ne $adminSid
+        })
+      if ($others.Count -gt 0) {
+        # Cut inheritance but keep the inherited rules as explicit ones, so
+        # nothing already granted to SYSTEM or Administrators is lost, then
+        # re-read and remove ONLY the allow rules of every other principal.
+        # Existing narrower grants for SYSTEM / Administrators and any deny
+        # rules are left exactly as they are: this only ever narrows. (This
+        # process already holds FullControl on the key, so SYSTEM needs no
+        # extra grant to finish the write.)
+        $acl.SetAccessRuleProtection($true, $true)
+        $key.SetAccessControl($acl)
+        $acl = $key.GetAccessControl()
+        $others = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+          Where-Object {
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            $_.IdentityReference -ne $systemSid -and $_.IdentityReference -ne $adminSid
+          })
+        foreach ($rule in $others) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+        $key.SetAccessControl($acl)
+      }
+
+      # ---- idempotence --------------------------------------------------------
+      $oldUser = $key.GetValue('NatsUser', $null)
+      $oldPass = $key.GetValue('NatsPassword', $null)
+      if (($oldUser -is [string]) -and ($oldPass -is [string]) -and
+          ($oldUser -ceq $natsUser) -and ($oldPass -ceq $natsPass)) {
+        # A matching pair with a leftover marker is a run that died after the
+        # writes; the pair is verified above, so just clear the marker.
+        $key.DeleteValue('NatsProvisionPending', $false)
+        Write-Output 'unchanged'
+        return
+      }
+
+      function Restore-Value {
+        param($Name, $Old)
+        if ($null -eq $Old) { $key.DeleteValue($Name, $false) }
+        else { $key.SetValue($Name, $Old, [Microsoft.Win32.RegistryValueKind]::String) }
+      }
+
+      # ---- write: user, then password; roll back on any failure -------------
+      $str = [Microsoft.Win32.RegistryValueKind]::String
+      try {
+        $key.SetValue('NatsProvisionPending', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $key.SetValue('NatsUser', $natsUser, $str)
+        $key.SetValue('NatsPassword', $natsPass, $str)
+        if (($key.GetValue('NatsUser', $null) -cne $natsUser) -or
+            ($key.GetValue('NatsPassword', $null) -cne $natsPass)) {
+          throw 'read-back mismatch'
+        }
+        $key.DeleteValue('NatsProvisionPending', $false)
+      } catch {
+        # The marker is left in place if the restore itself fails, so the
+        # machine still reads as not ready.
+        try {
+          Restore-Value 'NatsUser' $oldUser
+          Restore-Value 'NatsPassword' $oldPass
+          $key.DeleteValue('NatsProvisionPending', $false)
+        } catch { }
+        throw 'writing the NATS credential failed; the previous state was restored'
+      }
+    } finally {
+      $key.Close()
+    }
+    Write-Output 'written'

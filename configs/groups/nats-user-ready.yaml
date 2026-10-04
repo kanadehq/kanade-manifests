@@ -1,0 +1,42 @@
+# Windows machines whose latest check-nats-user result is `ok`: they hold the
+# agent role's NATS user and password.
+#
+#   kanade group def create configs/groups/nats-user-ready.yaml
+#
+# ## What a group cannot say
+#
+# Membership lists machines that reported `ok`. It cannot list machines with no
+# result at all - never ran the check, offline since before it was registered -
+# and those are exactly the ones the broker switch would lock out. So this
+# group is for targeting and for watching it fill up; the decision to switch
+# rests on the NOT-ready list, which is empty only when every Windows machine
+# has reported ok:
+#
+#   SELECT hw.pc_id
+#   FROM inventory_facts hw
+#   LEFT JOIN inventory_facts c
+#          ON c.pc_id = hw.pc_id AND c.job_id = 'check-nats-user'
+#   WHERE hw.job_id = 'inventory-hw'
+#     AND COALESCE(json_extract(c.facts_json, '$.status'), 'unknown') <> 'ok'
+#   ORDER BY hw.pc_id
+#
+# The base is every machine with an inventory-hw row (the same convention as
+# the `clients` and `servers` groups), so a machine that has not yet reported
+# hardware is not listed either. `inventory_facts` keeps one row per
+# (pc_id, job), the latest, so no per-machine "latest" filter is needed.
+# Group membership is cached up to `refresh` old, and a long result can be
+# truncated: run the query directly and read the count before trusting it.
+#
+# Presence is not correctness: a mistyped password is a member here.
+id: nats-user-ready
+description: >-
+  Windows machines whose latest check-nats-user result is ok (both NATS values
+  present). Not a safety proof for the broker switch: see the not-ready query
+  in this file's header.
+tags: [security, nats]
+refresh: 10m
+query: |
+  SELECT pc_id
+  FROM inventory_facts
+  WHERE job_id = 'check-nats-user'
+    AND json_extract(facts_json, '$.status') = 'ok'
