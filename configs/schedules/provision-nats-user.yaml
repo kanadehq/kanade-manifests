@@ -1,0 +1,41 @@
+# Carry the agent role's NATS user to every Windows machine, including the
+# ones that are offline right now.
+#
+#   kanade job create      configs/jobs/provision-nats-user.yaml
+#   kanade schedule create configs/schedules/provision-nats-user.yaml
+#
+# ## Why a schedule and not a one-shot exec
+#
+# A machine that is offline when the credential is distributed keeps the old
+# one, and is locked out the moment the broker is switched. A one-shot reaches
+# only the machines that are up at that instant; a schedule keeps trying until
+# each machine has applied the current version.
+#
+# ## per_pc: once_per_version
+#
+# Each machine applies each job `version` exactly once, and bumping `version`
+# in the job manifest re-arms the whole fleet. That is also the trap: changing
+# the credential WITHOUT bumping the version reaches nobody who already ran it,
+# and check-nats-user cannot notice (it sees presence, not content), so every
+# machine keeps reporting ready on the old value. Always bump the version.
+#
+# ## Backend-driven, metered
+#
+# Backend-driven (the default) because the job's purpose is to deliver a new
+# value, which an agent-side tick running from cached job state cannot do.
+# `once_per_version` fires as an explicit pc list, so `max_concurrent` is what
+# meters the dispatch itself (~200 machines per minute-long tick) and `jitter`
+# stays well under the 1-minute poll so the in-flight count does not lag and
+# overshoot the cap. It is smoothing, not a hard limit: a failed count fails
+# open.
+id: provision-nats-user
+tags: [security, nats]
+enabled: true
+job_id: provision-nats-user
+target:
+  all: true
+when:
+  per_pc: once_per_version
+jitter: 30s
+constraints:
+  max_concurrent: 200

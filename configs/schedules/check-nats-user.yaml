@@ -1,0 +1,18 @@
+# Fires the registered `check-nats-user` job per-PC every hour.
+#
+# Hourly rather than the 4h/24h of the other checks: this one is watched
+# during a rollout, where the operator waits for machines to come back and
+# report, and a slow cadence only delays the switch. The read is a single
+# registry key, so the cost is negligible. Once the broker is switched it can
+# be relaxed or the schedule disabled.
+#
+#   kanade schedule create configs/schedules/check-nats-user.yaml
+id: check-nats-user
+when:
+  per_pc: { every: 1h }
+enabled: true
+job_id: check-nats-user
+target:
+  all: true
+jitter: 5m
+tags: [health-check, security, nats]
