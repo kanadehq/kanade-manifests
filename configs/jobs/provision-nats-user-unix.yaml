@@ -136,7 +136,7 @@ execute:
 
     fail() { echo "$1" >&2; exit 1; }
 
-    for t in base64 iconv tr wc sed grep cmp cat cp mv rm mktemp chown chmod uname; do
+    for t in base64 iconv tr wc sed grep sort cmp cat cp mv rm mktemp chown chmod uname; do
       command -v "$t" >/dev/null 2>&1 || fail "required tool missing: $t"
     done
     os=$(uname -s)
@@ -220,7 +220,15 @@ execute:
     chmod 0600 "$new"
 
     # ---- idempotence ---------------------------------------------------------
-    if [ -f "$envf" ] && [ ! -e "$marker" ] && cmp -s "$new" "$envf"; then
+    # The pair counts as already in place wherever its two lines sit in the file
+    # (setup-agent.sh writes it after the token, but order carries no meaning to
+    # either reader); a duplicate or a different value does not match.
+    same=0
+    if [ -f "$envf" ] && [ ! -e "$marker" ]; then
+      grep -a -e "$pair_re_user" -e "$pair_re_pass" "$new" | sort > "$exp"
+      grep -a -e "$pair_re_user" -e "$pair_re_pass" "$envf" | sort | cmp -s - "$exp" && same=1
+    fi
+    if [ "$same" -eq 1 ]; then
       chown 0:0 "$envf"
       chmod 0600 "$envf"
       echo unchanged
