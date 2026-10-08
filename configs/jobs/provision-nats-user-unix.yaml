@@ -89,7 +89,9 @@
 # (it reinstalls the plist and keeps the pair already in agent.env).
 # check-nats-user-unix reports such a Mac as `fail` with the detail `launcher
 # does not pass the user pair` until then, and this job reports `restart
-# pending` for it instead of restarting uselessly.
+# pending` for it instead of restarting uselessly. The same holds for a Mac whose
+# agent.env has no KANADE_NATS_TOKEN line: the launcher exits without starting the
+# agent in that case, so the job writes the pair but never restarts it.
 #
 # ## Placeholders
 #
@@ -277,8 +279,12 @@ execute:
         restart=scheduled
       fi
     else
-      # A launcher that does not export the pair would restart for nothing.
-      if grep -q 'KANADE_NATS_USER' "$plist" 2>/dev/null && command -v launchctl >/dev/null 2>&1; then
+      # A launcher that does not export the pair would restart for nothing, and
+      # one that finds no token line exits before starting the agent, so a
+      # restart would turn a running agent into a stopped one.
+      if grep -q 'KANADE_NATS_USER' "$plist" 2>/dev/null \
+         && grep -q '^KANADE_NATS_TOKEN=.' "$envf" \
+         && command -v launchctl >/dev/null 2>&1; then
         nohup sh -c 'sleep 30; exec launchctl kickstart -k system/com.kanade.agent' \
           </dev/null >/dev/null 2>&1 &
         restart=scheduled
