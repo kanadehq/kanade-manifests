@@ -28,6 +28,10 @@
 # truncated: run the query directly and read the count before trusting it.
 #
 # Presence is not correctness: a mistyped password is a member here.
+#
+# Windows only: Linux and macOS report as check-nats-user-unix (group
+# nats-user-ready-unix), and nats-user-ready-fleet covers every platform,
+# including a not-ready query over all agents.
 id: nats-user-ready
 description: >-
   Windows machines whose latest check-nats-user result is ok (both NATS values

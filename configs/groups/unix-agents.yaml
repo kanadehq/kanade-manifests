@@ -1,0 +1,18 @@
+# Machines whose agent reports a Linux or macOS OS family. The Unix counterpart
+# of windows-agents: a schedule target has no OS filter of its own, so this
+# group is what keeps `shell: sh` jobs off Windows agents.
+#
+#   kanade group def create configs/groups/unix-agents.yaml
+#
+# `os_family` is the agent's own `std::env::consts::OS` ("linux", "macos"),
+# reported with its heartbeat. A machine that has not reported one yet is NOT a
+# member, so it is reached by the Windows group instead; once it reports, it
+# moves to the right one.
+id: unix-agents
+description: "Agents reporting os_family linux or macos"
+tags: [targeting, os]
+refresh: 10m
+query: |
+  SELECT pc_id
+  FROM agents
+  WHERE os_family IN ('linux', 'macos')

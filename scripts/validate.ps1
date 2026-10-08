@@ -10,8 +10,12 @@
     2. Cross-checks: schedule job_id -> an existing job id, README links
        resolve, every manifest under configs/ is linked from README.
     3. PowerShell syntax of scripts/**/*.ps1 and of job `execute.script`
-       bodies (parsed only, never run). `REPLACE-` placeholders are expected
-       and are not an error.
+       bodies (parsed only, never run), and `sh -n` of `shell: sh` job
+       bodies. `REPLACE-` placeholders are expected and are not an error.
+    4. NATS credential manifests: each provision job carries exactly the two
+       placeholder lines and no other base64 value (so no secret is committed),
+       and no NATS schedule targets `all: true` (a target has no OS filter, so
+       the Windows and Unix schedules are kept apart by groups, which must exist).
 
   Needs `kanade` and `pwsh` on PATH. Run from anywhere:  pwsh scripts/validate.ps1
 #>
@@ -153,6 +157,58 @@ foreach ($j in $jobs) {
   $info = $jobInfo[$j]
   if ($null -eq $info.Body -or $info.Shell -notin 'powershell', 'pwsh') { continue }
   Test-Syntax $j ($info.BodyLine - 1) { param($e) [void][System.Management.Automation.Language.Parser]::ParseInput($info.Body, [ref]$null, $e) }
+}
+
+foreach ($j in $jobs) {
+  $info = $jobInfo[$j]
+  if ($null -eq $info.Body -or $info.Shell -ne 'sh') { continue }
+  $sh = Get-Command sh -ErrorAction SilentlyContinue
+  if (-not $sh) { Write-Host "::warning::sh not found on PATH; skipping the syntax check of $j"; continue }
+  $tmp = [System.IO.Path]::GetTempFileName()
+  try {
+    [System.IO.File]::WriteAllText($tmp, $info.Body + "`n")
+    $out = & $sh.Source -n $tmp 2>&1
+    if ($LASTEXITCODE -ne 0) { Add-Problem "${j}: sh -n failed: $(($out | Out-String).Trim() -replace [regex]::Escape($tmp), 'script')" }
+  } finally { Remove-Item -Force -ErrorAction SilentlyContinue $tmp }
+}
+
+# ---- 4. NATS credential manifests --------------------------------------------
+# Committed copies must hold placeholders only. Each provision job has exactly
+# the two placeholder assignments and no other base64 assignment; rendering
+# happens in scripts/provision-nats-user.ps1 into temporary copies.
+$provisionJobs = @{
+  'configs/jobs/provision-nats-user.yaml'      = @("`$userB64 = 'REPLACE-nats-user-b64'", "`$passB64 = 'REPLACE-nats-password-b64'")
+  'configs/jobs/provision-nats-user-unix.yaml' = @("user_b64='REPLACE-nats-user-b64'", "pass_b64='REPLACE-nats-password-b64'")
+}
+foreach ($p in $provisionJobs.Keys) {
+  if (-not (Test-Path -LiteralPath $p)) { Add-Problem "${p}: missing"; continue }
+  $lines = [System.IO.File]::ReadAllLines((Join-Path (Get-Location) $p))
+  foreach ($want in $provisionJobs[$p]) {
+    $n = @($lines | Where-Object { $_.Trim() -ceq $want }).Count
+    if ($n -ne 1) { Add-Problem "${p}: expected exactly one placeholder line '$want', found $n" }
+  }
+  $assigns = @($lines | Where-Object { $_ -match '(?i)b64\s*=\s*[''"]' })
+  if ($assigns.Count -ne 2) { Add-Problem "${p}: $($assigns.Count) base64 assignment lines; only the 2 placeholder lines are allowed (is a credential committed?)" }
+}
+foreach ($f in @('configs/jobs/provision-nats-user-unix.yaml', 'configs/jobs/check-nats-user-unix.yaml',
+                 'configs/schedules/provision-nats-user-unix.yaml', 'configs/schedules/check-nats-user-unix.yaml',
+                 'configs/groups/unix-agents.yaml', 'configs/groups/windows-agents.yaml',
+                 'configs/groups/nats-user-ready-unix.yaml', 'configs/groups/nats-user-ready-fleet.yaml')) {
+  if ($f -notin $allYaml) { Add-Problem "${f}: missing" }
+}
+$groupIds = @($groups | ForEach-Object { Get-Scalar ([System.IO.File]::ReadAllLines((Join-Path (Get-Location) $_))) 'id' })
+$natsSchedules = @{
+  'configs/schedules/provision-nats-user.yaml'      = 'windows-agents'
+  'configs/schedules/check-nats-user.yaml'          = 'windows-agents'
+  'configs/schedules/provision-nats-user-unix.yaml' = 'unix-agents'
+  'configs/schedules/check-nats-user-unix.yaml'     = 'unix-agents'
+}
+foreach ($s in $natsSchedules.Keys) {
+  if (-not (Test-Path -LiteralPath $s)) { continue }
+  $text = [System.IO.File]::ReadAllText((Join-Path (Get-Location) $s))
+  if ($text -match '(?m)^\s+all\s*:\s*true') { Add-Problem "${s}: targets all: true; a target has no OS filter, use the $($natsSchedules[$s]) group" }
+  if ($text -notmatch "(?m)^\s+groups\s*:\s*\[\s*$($natsSchedules[$s])\s*\]") { Add-Problem "${s}: must target groups: [$($natsSchedules[$s])]" }
+  if ($natsSchedules[$s] -notin $groupIds) { Add-Problem "${s}: group '$($natsSchedules[$s])' is not defined under configs/groups" }
 }
 
 # ---- result -----------------------------------------------------------------

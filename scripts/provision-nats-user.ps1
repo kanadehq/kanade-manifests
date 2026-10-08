@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-  Distribute the agent role's NATS user to the fleet: provisioning job and
-  schedule, readiness check and schedule, and the readiness group - from one
-  set of values.
+  Distribute the agent role's NATS user to the fleet - Windows and
+  Linux/macOS - from one set of values: the provisioning jobs and schedules,
+  the readiness checks and schedules, and the OS and readiness groups.
 
 .DESCRIPTION
   The manifests under configs/ ship with REPLACE- placeholders. This script
@@ -20,8 +20,15 @@
   fleet check and locks the machine out at the broker switch, so it is
   confirmed). Nothing here echoes it.
 
+  One invocation fills and applies both the Windows manifests
+  (provision-nats-user, check-nats-user) and the Unix ones
+  (provision-nats-user-unix, check-nats-user-unix) from the same values, so the
+  platforms cannot end up on different credentials. pwsh runs this script on
+  any operating system.
+
   Does NOT touch the broker. Switching it is a separate step, done only after
-  check-nats-user reports every Windows machine ready.
+  every machine, of every platform, reports ready (the not-ready query in
+  configs/groups/nats-user-ready-fleet.yaml is empty).
 
 .PARAMETER User
   The agent role's NATS user. Prompted for if omitted. Letters, digits, '_',
@@ -32,8 +39,8 @@
   prompt over building a SecureString from plain text on a command line.
 
 .PARAMETER JobVersion
-  Version stamped on the provisioning job. MUST differ from the version
-  committed in the manifest and higher than the last version applied from this
+  Version stamped on BOTH provisioning jobs (Windows and Unix). MUST be higher
+  than the larger of the two versions committed in the manifests, and higher than the last version applied from this
   machine (recorded when an apply starts), and must be bumped whenever the credential
   changes: the schedule uses `per_pc: once_per_version`, so the version is what
   re-arms the fleet. Reusing it means the new value reaches nobody who already
@@ -70,7 +77,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$jobSrc = Join-Path $repoRoot 'configs\jobs\provision-nats-user.yaml'
+$provisionSrcs = @(
+    (Join-Path $repoRoot 'configs/jobs/provision-nats-user.yaml'),
+    (Join-Path $repoRoot 'configs/jobs/provision-nats-user-unix.yaml')
+)
 
 if (-not (Get-Command kanade -ErrorAction SilentlyContinue)) {
     throw "kanade CLI not found on PATH - install it before running this script."
@@ -81,18 +91,26 @@ if (-not (Get-Command kanade -ErrorAction SilentlyContinue)) {
 # same version with a new credential reaches nobody who ran the old one, and
 # check-nats-user (presence only) keeps reporting them ready.
 if ($JobVersion -notmatch '^\d+\.\d+\.\d+$') { throw "-JobVersion '$JobVersion' is not a x.y.z version." }
-if (-not (Test-Path $jobSrc)) { throw "missing manifest: $jobSrc" }
-$committed = [regex]::Match((Get-Content -LiteralPath $jobSrc -Raw), '(?m)^version:\s*(\S+)').Groups[1].Value
-if ($JobVersion -eq $committed) {
-    throw "-JobVersion $JobVersion is the version already in the manifest. Bump it: the schedule reaches nobody who applied that version."
+# Both provisioning jobs are stamped with the same version, so the guard is on
+# the larger of the two committed ones.
+$committedVersions = @()
+foreach ($src in $provisionSrcs) {
+    if (-not (Test-Path $src)) { throw "missing manifest: $src" }
+    $v = [regex]::Match((Get-Content -LiteralPath $src -Raw), '(?m)^version:\s*(\S+)').Groups[1].Value
+    if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "cannot read an x.y.z version from $src" }
+    $committedVersions += [version]$v
 }
-if ([version]$JobVersion -lt [version]$committed) { throw "-JobVersion $JobVersion is older than the manifest's $committed." }
+$committed = ($committedVersions | Sort-Object -Descending | Select-Object -First 1).ToString()
+if ($JobVersion -eq $committed) {
+    throw "-JobVersion $JobVersion is the version already in a manifest. Bump it: the schedule reaches nobody who applied that version."
+}
+if ([version]$JobVersion -lt [version]$committed) { throw "-JobVersion $JobVersion is older than the manifests' $committed." }
 # The manifest never records what was last APPLIED, so remember it locally: a
 # second credential change under the same version would otherwise pass the
 # check above and reach nobody who already ran the first. This only sees
 # applies made from this machine and account; from elsewhere, check the
 # registered job's version yourself.
-$stateFile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'kanade\nats-user-last-version.txt'
+$stateFile = Join-Path (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'kanade') 'nats-user-last-version.txt'
 if (-not (Test-Path $stateFile) -and $Apply -and -not $ConfirmVersionBumped) {
     throw "no record of earlier applies from this machine. Check the version the registered provision-nats-user job carries, make sure -JobVersion is higher, and re-run with -ConfirmVersionBumped."
 }
@@ -125,7 +143,7 @@ if ($Password) {
     $plain = $p1
 }
 
-# Same rules the agent-side job enforces; failing here is cheaper than failing
+# Same rules both agent-side jobs enforce; failing here is cheaper than failing
 # on every machine.
 if ($User -notmatch '^[A-Za-z0-9_.-]{1,128}$') { throw "user must be 1-128 characters of A-Z a-z 0-9 _ . -" }
 if ([string]::IsNullOrWhiteSpace($plain))      { throw 'the password is empty.' }
@@ -139,30 +157,48 @@ $plain = $null
 
 # ---- render ----------------------------------------------------------------
 # APPLY order, with the kind in the output name: a job and its schedule share a
-# basename and would otherwise overwrite each other. Jobs first, the group next,
-# schedules last (a schedule naming a missing job is an error mid-apply).
+# basename and would otherwise overwrite each other. Jobs first, the groups
+# next (a schedule naming a missing group, like one naming a missing job, is an
+# error mid-apply), schedules last. Provision = the job carrying the credential,
+# whose version is stamped from -JobVersion.
+$cfg = Join-Path $repoRoot 'configs'
 $targets = @(
-    @{ Name = 'provision-nats-user job';      Kind = 'job';      Out = 'job-provision-nats-user.yaml';      Src = "$repoRoot\configs\jobs\provision-nats-user.yaml" }
-    @{ Name = 'check-nats-user job';          Kind = 'job';      Out = 'job-check-nats-user.yaml';          Src = "$repoRoot\configs\jobs\check-nats-user.yaml" }
-    @{ Name = 'nats-user-ready group';        Kind = 'group';    Out = 'group-nats-user-ready.yaml';        Src = "$repoRoot\configs\groups\nats-user-ready.yaml" }
-    @{ Name = 'provision schedule';           Kind = 'schedule'; Out = 'schedule-provision-nats-user.yaml'; Src = "$repoRoot\configs\schedules\provision-nats-user.yaml" }
-    @{ Name = 'check schedule';               Kind = 'schedule'; Out = 'schedule-check-nats-user.yaml';     Src = "$repoRoot\configs\schedules\check-nats-user.yaml" }
+    @{ Name = 'provision-nats-user job';        Kind = 'job';      Provision = $true;  Out = 'job-provision-nats-user.yaml';           Src = (Join-Path $cfg 'jobs/provision-nats-user.yaml') }
+    @{ Name = 'check-nats-user job';            Kind = 'job';      Provision = $false; Out = 'job-check-nats-user.yaml';               Src = (Join-Path $cfg 'jobs/check-nats-user.yaml') }
+    @{ Name = 'provision-nats-user-unix job';   Kind = 'job';      Provision = $true;  Out = 'job-provision-nats-user-unix.yaml';      Src = (Join-Path $cfg 'jobs/provision-nats-user-unix.yaml') }
+    @{ Name = 'check-nats-user-unix job';       Kind = 'job';      Provision = $false; Out = 'job-check-nats-user-unix.yaml';          Src = (Join-Path $cfg 'jobs/check-nats-user-unix.yaml') }
+    @{ Name = 'windows-agents group';           Kind = 'group';    Provision = $false; Out = 'group-windows-agents.yaml';              Src = (Join-Path $cfg 'groups/windows-agents.yaml') }
+    @{ Name = 'unix-agents group';              Kind = 'group';    Provision = $false; Out = 'group-unix-agents.yaml';                 Src = (Join-Path $cfg 'groups/unix-agents.yaml') }
+    @{ Name = 'nats-user-ready group';          Kind = 'group';    Provision = $false; Out = 'group-nats-user-ready.yaml';             Src = (Join-Path $cfg 'groups/nats-user-ready.yaml') }
+    @{ Name = 'nats-user-ready-unix group';     Kind = 'group';    Provision = $false; Out = 'group-nats-user-ready-unix.yaml';        Src = (Join-Path $cfg 'groups/nats-user-ready-unix.yaml') }
+    @{ Name = 'nats-user-ready-fleet group';    Kind = 'group';    Provision = $false; Out = 'group-nats-user-ready-fleet.yaml';       Src = (Join-Path $cfg 'groups/nats-user-ready-fleet.yaml') }
+    @{ Name = 'provision schedule';             Kind = 'schedule'; Provision = $false; Out = 'schedule-provision-nats-user.yaml';      Src = (Join-Path $cfg 'schedules/provision-nats-user.yaml') }
+    @{ Name = 'check schedule';                 Kind = 'schedule'; Provision = $false; Out = 'schedule-check-nats-user.yaml';          Src = (Join-Path $cfg 'schedules/check-nats-user.yaml') }
+    @{ Name = 'provision schedule (unix)';      Kind = 'schedule'; Provision = $false; Out = 'schedule-provision-nats-user-unix.yaml'; Src = (Join-Path $cfg 'schedules/provision-nats-user-unix.yaml') }
+    @{ Name = 'check schedule (unix)';          Kind = 'schedule'; Provision = $false; Out = 'schedule-check-nats-user-unix.yaml';     Src = (Join-Path $cfg 'schedules/check-nats-user-unix.yaml') }
 )
 
-# A directory only the operator and SYSTEM can read, from the moment it exists:
-# the copies hold the password.
+# A directory only the operator (and SYSTEM, on Windows) can read, from the
+# moment it exists: the copies hold the password.
+$onWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or ($IsWindows -eq $true)
 $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("kanade-nats-{0}" -f ([Guid]::NewGuid().ToString('N')))
-$sec = New-Object System.Security.AccessControl.DirectorySecurity
-$sec.SetAccessRuleProtection($true, $false)
-$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$sys = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-foreach ($sid in @($me, $sys)) {
-    $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+if ($onWindows) {
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $sys = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    foreach ($sid in @($me, $sys)) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
 }
 
 try {
-    if ([System.IO.Directory].GetMethod('CreateDirectory', [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))) {
+    if (-not $onWindows) {
+        # Created 0700 in one step, so there is no window with a wider mode.
+        & mkdir -m 700 $tmpDir
+        if ($LASTEXITCODE -ne 0) { throw "cannot create the private temporary directory" }
+    } elseif ([System.IO.Directory].GetMethod('CreateDirectory', [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))) {
         [System.IO.Directory]::CreateDirectory($tmpDir, $sec) | Out-Null
     } else {
         [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($tmpDir)), $sec) | Out-Null
@@ -176,8 +212,9 @@ try {
         $text = (Get-Content -LiteralPath $t.Src -Raw).
             Replace('REPLACE-nats-user-b64',     $userB64).
             Replace('REPLACE-nats-password-b64', $passB64)
-        if ($t.Kind -eq 'job' -and $t.Src -like '*provision-nats-user.yaml') {
-            # Only the distribution job's version re-arms the fleet.
+        if ($t.Provision) {
+            # Only the distribution jobs' version re-arms the fleet, and both
+            # platforms are stamped alike.
             $text = $text -replace '(?m)^version:.*$', "version: $JobVersion"
         }
         if ($text -match 'REPLACE-') {
@@ -233,9 +270,11 @@ try {
         Write-Host "Applied. Distribution starts on the schedule's next tick." -ForegroundColor Green
         Write-Host ''
         Write-Host "Next, in order:"
-        Write-Host "  1. Wait for check-nats-user to report ok everywhere; offline machines catch up as they return"
-        Write-Host "  2. List the machines that are NOT ready (query in configs/groups/nats-user-ready.yaml) until it is empty"
-        Write-Host "  3. Only then switch the broker (done elsewhere), keeping the switch revertible"
+        Write-Host "  1. Wait for check-nats-user (Windows) and check-nats-user-unix (Linux/macOS) to report ok; offline machines catch up as they return"
+        Write-Host "  2. macOS: a Mac whose launcher predates the user pair reports 'launcher does not pass the user pair' - re-run the agent's setup-agent.sh there once"
+        Write-Host "  3. List the machines that are NOT ready (query in configs/groups/nats-user-ready-fleet.yaml) until it is empty"
+        Write-Host "  4. Unix agents restart themselves about 30 seconds after a write; confirm they came back before the switch"
+        Write-Host "  5. Only then switch the broker (done elsewhere), keeping the switch revertible"
     }
 } finally {
     # The copies hold the password: remove them on every path, dry run included.

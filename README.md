@@ -73,6 +73,7 @@ remediation job below via `check.troubleshoot:`.
 | [`check-disk-space`](configs/jobs/check-disk-space.yaml) | [✓](configs/schedules/check-disk-space.yaml) | Free space on the system drive |
 | [`check-firewall`](configs/jobs/check-firewall.yaml) | [✓](configs/schedules/check-firewall.yaml) | Windows Firewall enabled on all profiles |
 | [`check-nats-user`](configs/jobs/check-nats-user.yaml) | [✓](configs/schedules/check-nats-user.yaml) | NATS role credential present on the machine (presence only, never the value) |
+| [`check-nats-user-unix`](configs/jobs/check-nats-user-unix.yaml) | [✓](configs/schedules/check-nats-user-unix.yaml) | The same presence check on Linux and macOS agents (also flags a macOS launcher that does not pass the pair) |
 | [`check-pending-reboot`](configs/jobs/check-pending-reboot.yaml) | [✓](configs/schedules/check-pending-reboot.yaml) | Waiting on a reboot (CBS / Windows Update / file-rename) |
 | [`check-windows-patches`](configs/jobs/check-windows-patches.yaml) | [✓](configs/schedules/check-windows-patches.yaml) | Pending security updates per PC |
 | [`edge-extensions`](configs/jobs/edge-extensions.yaml) | [✓](configs/schedules/edge-extensions.yaml) | Edge installed-extension compliance + inventory, all local users |
@@ -191,7 +192,7 @@ temporary copies, so no fleet-specific value is committed here.
 **These manifests carry `REPLACE-...` placeholders and must go through
 [`scripts/provision-nats-user.ps1`](scripts/provision-nats-user.ps1); never
 apply them as-is. They put the agent role's NATS user and password on every
-Windows agent and let you confirm coverage. They do not touch the broker:
+agent - Windows, Linux and macOS - and let you confirm coverage. They do not touch the broker:
 switching it from the shared token to per-role users happens elsewhere, and
 only after the steps below.**
 
@@ -201,32 +202,70 @@ and is locked out at the switch, so distribution is a schedule
 
 Order of operations:
 
-1. **Distribute.** Run the script (dry run by default, `-Apply` to apply). The
+1. **Distribute.** Run the script (dry run by default, `-Apply` to apply).
+   One invocation fills and applies the Windows and the Unix manifests from
+   the same values, with one `-JobVersion` for both provision jobs. The
    password is read from a hidden prompt (asked twice), a SecureString, or
    `KANADE_NATS_AGENT_PASSWORD`, never from a plain argument by default. The
-   existing token is left alone.
-2. **Confirm coverage.** `check-nats-user` reports `{"present": true|false}`
-   per machine, as SYSTEM. Run the not-ready query (below) until it returns
-   nothing; offline machines appear there until they come back and report.
-3. **Switch the broker**, elsewhere.
+   existing token is left alone. pwsh runs the script on any platform.
+2. **Confirm coverage.** `check-nats-user` (Windows) and
+   `check-nats-user-unix` (Linux, macOS) report `{"present": true|false}`
+   per machine, as SYSTEM / root. Run the not-ready query (below) until it
+   returns nothing; offline machines appear there until they come back and
+   report.
+3. **Let the Unix agents restart.** See "Linux and macOS" below.
+4. **Switch the broker**, elsewhere.
 
-The `nats-user-ready` group lists machines whose check is `ok`, but a group
-cannot list machines with no result, which are the dangerous ones. The useful
-list is the machines that are **not** ready:
+A manifest target has no OS filter (`all` / `groups` / `pcs` only), so the OS
+is selected by group on the `os_family` the agent reports: the Windows
+schedules target `windows-agents` (Windows, or an agent that has not reported
+an OS yet) and the Unix ones target `unix-agents` (`linux` or `macos`). The
+Windows schedules used to target `all`, which would also have started
+`powershell` on Linux and macOS agents and failed there on every attempt.
+
+The `nats-user-ready` group (Windows), `nats-user-ready-unix` and
+`nats-user-ready-fleet` (every platform) list machines whose check is `ok`, but
+a group cannot list machines with no result, which are the dangerous ones. The
+useful list is the machines that are **not** ready, over every agent:
 
 ```sql
-SELECT hw.pc_id
-FROM inventory_facts hw
+SELECT a.pc_id, a.os_family
+FROM agents a
 LEFT JOIN inventory_facts c
-       ON c.pc_id = hw.pc_id AND c.job_id = 'check-nats-user'
-WHERE hw.job_id = 'inventory-hw'
-  AND COALESCE(json_extract(c.facts_json, '$.status'), 'unknown') <> 'ok'
-ORDER BY hw.pc_id
+       ON c.pc_id = a.pc_id
+      AND c.job_id = CASE WHEN a.os_family IN ('linux', 'macos')
+                          THEN 'check-nats-user-unix'
+                          ELSE 'check-nats-user' END
+WHERE COALESCE(json_extract(c.facts_json, '$.status'), 'unknown') <> 'ok'
+ORDER BY a.pc_id
 ```
 
 Group membership can lag by its `refresh` interval and long results can be
-truncated, so run the query itself and read the count. Machines with no
-`inventory-hw` row are not in the base list either.
+truncated, so run the query itself and read the count. The base is `agents`,
+so a retired machine stays on the list until it is removed there.
+
+### Linux and macOS
+
+`provision-nats-user-unix` writes `KANADE_NATS_USER` / `KANADE_NATS_PASSWORD`
+into `/etc/kanade/agent.env` in the format the agent's own setup script uses
+(quoted for systemd on Linux, raw for the macOS launcher), keeps every other
+line - the token above all - byte for byte, replaces any earlier pair, and
+renames a new 0600 root file into place. A marker file
+(`/etc/kanade/.nats-provision-pending`) covers an interrupted run: the check
+reports such a machine as not ready and the retried run clears it.
+
+- **The agent only reads these variables at start.** After a write the job
+  schedules a detached restart about 30 seconds later (a transient systemd
+  timer on Linux, a detached `launchctl kickstart -k` on macOS) and reports
+  `written (restart scheduled)`; when it cannot, `written (restart pending)`,
+  and the pair takes effect at the next agent restart. `unchanged` never
+  restarts anything. A check `ok` says the file holds the pair, not that the
+  running agent has loaded it, so let the restarts finish before the switch.
+- **macOS needs a launcher that passes the pair.** A LaunchDaemon plist
+  installed before user/password support exports only the token. The job does
+  not rewrite the plist; re-run the agent's `setup-agent.sh` from a current
+  bundle once on each such Mac. Until then `check-nats-user-unix` reports
+  `fail` with `launcher does not pass the user pair`.
 
 Warnings:
 
@@ -237,8 +276,9 @@ Warnings:
   encoding, not secrecy.
 - **Backend and break-glass credentials are never distributed this way.**
   They are written on their own hosts by the deployment scripts.
-- **Linux and macOS agents** get the pair from their setup scripts; these jobs
-  are Windows-only, and those machines are not in the not-ready list.
+- **Linux and macOS agents** can still get the pair from their setup scripts
+  (`KANADE_NATS_USER` / `KANADE_NATS_PASSWORD`); the Unix job does the same
+  later, from the fleet, and leaves a pair that is already identical alone.
 - **Changing the credential means bumping the job version**, or machines that
   already applied the old one never receive it, and the check keeps reporting
   them ready. The script refuses the committed version and any version at or below the one it last applied from the same machine; on a machine with no such record, `-Apply` needs `-ConfirmVersionBumped`, meaning you checked the registered job's version.
@@ -250,8 +290,13 @@ Warnings:
 |---|---|---|
 | [`provision-nats-user`](configs/jobs/provision-nats-user.yaml) | [✓](configs/schedules/provision-nats-user.yaml) | Write `NatsUser` / `NatsPassword` under the agent's registry key (SYSTEM + Administrators only), once per version |
 | [`check-nats-user`](configs/jobs/check-nats-user.yaml) | [✓](configs/schedules/check-nats-user.yaml) | Read-only presence check as SYSTEM; reports no length, hash or prefix |
-| [`nats-user-ready`](configs/groups/nats-user-ready.yaml) | — | Group of machines whose latest check is `ok`; header carries the not-ready query |
-| [`provision-nats-user.ps1`](scripts/provision-nats-user.ps1) | — | Fills the placeholders into private temp copies and applies them in order; dry-run by default |
+| [`provision-nats-user-unix`](configs/jobs/provision-nats-user-unix.yaml) | [✓](configs/schedules/provision-nats-user-unix.yaml) | Write the pair into `/etc/kanade/agent.env` on Linux and macOS (atomic, 0600 root), then schedule a detached agent restart; once per version |
+| [`check-nats-user-unix`](configs/jobs/check-nats-user-unix.yaml) | [✓](configs/schedules/check-nats-user-unix.yaml) | Read-only presence check as root; reports no length, hash or prefix; flags a macOS launcher that does not pass the pair |
+| [`nats-user-ready`](configs/groups/nats-user-ready.yaml) | — | Windows machines whose latest check is `ok`; header carries the Windows not-ready query |
+| [`nats-user-ready-unix`](configs/groups/nats-user-ready-unix.yaml) | — | Linux and macOS machines whose latest check is `ok` |
+| [`nats-user-ready-fleet`](configs/groups/nats-user-ready-fleet.yaml) | — | Machines on any platform whose latest check is `ok`; header carries the fleet-wide not-ready query |
+| [`windows-agents`](configs/groups/windows-agents.yaml) / [`unix-agents`](configs/groups/unix-agents.yaml) | — | Agents by reported OS family; what keeps the Windows and the Unix schedules apart |
+| [`provision-nats-user.ps1`](scripts/provision-nats-user.ps1) | — | Fills the placeholders of the Windows and Unix manifests into private temp copies and applies them in order; dry-run by default |
 
 ## Fleet targeting (groups)
 
@@ -265,7 +310,11 @@ Warnings:
 | [`hostname-prefix`](configs/groups/hostname-prefix.yaml) | Hosts named `SRV-*` by naming convention |
 | [`pilot-ring`](configs/groups/pilot-ring.yaml) | Manually curated early-adopter pilot machines |
 | [`win-24h2-clients`](configs/groups/win-24h2-clients.yaml) | Clients still on 24H2 (build 26100), staging for a 25H2 rollout |
-| [`nats-user-ready`](configs/groups/nats-user-ready.yaml) | Machines whose `check-nats-user` result is `ok`; see the NATS section for the not-ready query |
+| [`windows-agents`](configs/groups/windows-agents.yaml) | Agents reporting the Windows OS family (or none yet); target of the Windows NATS schedules |
+| [`unix-agents`](configs/groups/unix-agents.yaml) | Agents reporting Linux or macOS; target of the Unix NATS schedules |
+| [`nats-user-ready`](configs/groups/nats-user-ready.yaml) | Windows machines whose `check-nats-user` result is `ok`; see the NATS section for the not-ready query |
+| [`nats-user-ready-unix`](configs/groups/nats-user-ready-unix.yaml) | Linux and macOS machines whose `check-nats-user-unix` result is `ok` |
+| [`nats-user-ready-fleet`](configs/groups/nats-user-ready-fleet.yaml) | Machines on any platform whose NATS-user check is `ok`; header carries the fleet-wide not-ready query |
 
 ## Contributing
 

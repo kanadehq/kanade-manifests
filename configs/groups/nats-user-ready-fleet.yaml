@@ -1,0 +1,49 @@
+# Machines on ANY platform whose latest NATS-user check is `ok`: Windows by
+# check-nats-user, Linux and macOS by check-nats-user-unix.
+#
+#   kanade group def create configs/groups/nats-user-ready-fleet.yaml
+#
+# ## What a group cannot say
+#
+# Membership lists machines that reported `ok`. It cannot list machines with no
+# result at all - never ran the check, offline since before it was registered -
+# and those are exactly the ones the broker switch would lock out. The decision
+# to switch rests on the NOT-ready list, which is empty only when every agent has
+# reported ok. Its base is `agents`, so a machine that never reported hardware
+# or an OS family is listed too (it is read as Windows, the check it would have
+# been scheduled for before the OS split):
+#
+#   SELECT a.pc_id, a.os_family
+#   FROM agents a
+#   LEFT JOIN inventory_facts c
+#          ON c.pc_id = a.pc_id
+#         AND c.job_id = CASE WHEN a.os_family IN ('linux', 'macos')
+#                             THEN 'check-nats-user-unix'
+#                             ELSE 'check-nats-user' END
+#   WHERE COALESCE(json_extract(c.facts_json, '$.status'), 'unknown') <> 'ok'
+#   ORDER BY a.pc_id
+#
+# Every agent the backend has ever seen is a row of `agents`, so a retired
+# machine stays on that list until it is removed there. Group membership is
+# cached up to `refresh` old, and a long result can be truncated: run the query
+# directly and read the count before trusting it.
+#
+# `ok` means the credential is on the machine, not that a running Unix agent
+# has loaded it; see the README section "NATS role credentials, before the
+# switch". Presence is not correctness: a mistyped password is a member here.
+id: nats-user-ready-fleet
+description: >-
+  Machines on any platform whose latest NATS-user check is ok (Windows or
+  Linux/macOS). Not a safety proof for the broker switch: see the not-ready
+  query in this file's header.
+tags: [security, nats]
+refresh: 10m
+query: |
+  SELECT a.pc_id
+  FROM agents a
+  JOIN inventory_facts c
+    ON c.pc_id = a.pc_id
+   AND c.job_id = CASE WHEN a.os_family IN ('linux', 'macos')
+                       THEN 'check-nats-user-unix'
+                       ELSE 'check-nats-user' END
+  WHERE json_extract(c.facts_json, '$.status') = 'ok'

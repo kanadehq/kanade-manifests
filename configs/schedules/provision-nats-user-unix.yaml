@@ -1,0 +1,52 @@
+# Carry the agent role's NATS user to every Linux and macOS machine, including
+# the ones that are offline right now.
+#
+#   kanade group def create configs/groups/unix-agents.yaml
+#   kanade job create       configs/jobs/provision-nats-user-unix.yaml
+#   kanade schedule create  configs/schedules/provision-nats-user-unix.yaml
+#
+# ## Why a schedule and not a one-shot exec
+#
+# A machine that is offline when the credential is distributed keeps the old
+# one, and is locked out the moment the broker is switched. A one-shot reaches
+# only the machines that are up at that instant; a schedule keeps trying until
+# each machine has applied the current version.
+#
+# ## Why a group target
+#
+# A target has no OS filter (`all` / `groups` / `pcs` only). `unix-agents`
+# selects on the OS family the agent reports, so this `sh` job never reaches a
+# Windows agent, and the Windows job never reaches a Unix one.
+#
+# ## per_pc: once_per_version
+#
+# Each machine applies each job `version` exactly once, and bumping `version`
+# in the job manifest re-arms the whole fleet. That is also the trap: changing
+# the credential WITHOUT bumping the version reaches nobody who already ran it,
+# and check-nats-user-unix cannot notice (it sees presence, not content). Always
+# bump the version. scripts/provision-nats-user.ps1 requires a version higher
+# than both provision jobs' committed one and keeps the two in step.
+#
+# A write also restarts the agent a little later (see the job header), so a
+# credential change restarts the Unix agents of the fleet within the dispatch
+# window, which `max_concurrent` and `jitter` spread out.
+#
+# ## Backend-driven, metered
+#
+# Backend-driven (the default) because the job's purpose is to deliver a new
+# value, which an agent-side tick running from cached job state cannot do.
+# `once_per_version` fires as an explicit pc list, so `max_concurrent` is what
+# meters the dispatch itself and `jitter` stays well under the 1-minute poll so
+# the in-flight count does not lag and overshoot the cap. It is smoothing, not a
+# hard limit: a failed count fails open.
+id: provision-nats-user-unix
+tags: [security, nats]
+enabled: true
+job_id: provision-nats-user-unix
+target:
+  groups: [unix-agents]
+when:
+  per_pc: once_per_version
+jitter: 30s
+constraints:
+  max_concurrent: 200
