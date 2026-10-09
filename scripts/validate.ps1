@@ -352,3 +352,5 @@ if ($script:problems.Count -gt 0) {
   exit 1
 }
 Write-Host "OK: $($jobs.Count) jobs, $($schedules.Count) schedules, $($views.Count) views, $($groups.Count) groups."
+
+exit 0
