@@ -70,8 +70,12 @@
 # The delay lets this job's result reach the backend first; the restart
 # interrupts whatever else the agent is running at that moment, and a fleet
 # restarting together reconnects together, which the once_per_version metering
-# (max_concurrent) spreads out. When the restart cannot be scheduled (no
-# systemd, no service unit, a launcher that does not pass the user pair), the
+# (max_concurrent) spreads out. On both platforms the restart is scheduled only
+# when agent.env has a non-empty KANADE_NATS_TOKEN line: an agent restarted
+# with only the user pair is refused by a broker still on the shared token and
+# goes offline (on macOS the launcher would not even start it). When the
+# restart cannot be scheduled (no token line, no systemd, no service unit, a
+# launcher that does not pass the user pair), the
 # job still writes and reports `written (restart pending)`: the pair is in
 # effect at the next agent restart. `ok` from check-nats-user-unix means the
 # file holds the pair; it does not prove the running process has it. Do not
@@ -89,9 +93,7 @@
 # (it reinstalls the plist and keeps the pair already in agent.env).
 # check-nats-user-unix reports such a Mac as `fail` with the detail `launcher
 # does not pass the user pair` until then, and this job reports `restart
-# pending` for it instead of restarting uselessly. The same holds for a Mac whose
-# agent.env has no KANADE_NATS_TOKEN line: the launcher exits without starting the
-# agent in that case, so the job writes the pair but never restarts it.
+# pending` for it instead of restarting uselessly.
 #
 # ## Placeholders
 #
@@ -135,10 +137,11 @@ execute:
     envf=$dir/agent.env
     marker=$dir/.nats-provision-pending
     plist=/Library/LaunchDaemons/com.kanade.agent.plist
+    sdroot=/run/systemd/system
 
     fail() { echo "$1" >&2; exit 1; }
 
-    for t in base64 iconv tr wc sed grep sort cmp cat cp mv rm mktemp chown chmod uname; do
+    for t in base64 iconv tr wc sed grep sort cmp cat cp mv rm mktemp chown chmod uname tail; do
       command -v "$t" >/dev/null 2>&1 || fail "required tool missing: $t"
     done
     os=$(uname -s)
@@ -297,10 +300,20 @@ execute:
 
     # ---- make it take effect: detached, delayed, never from inside the job ---
     restart=pending
+    # Without a non-empty token line the restarted agent would present only the
+    # user pair, which a broker still on the shared token refuses. systemd reads
+    # an empty quoted value as an empty token; the macOS launcher reads it raw.
+    has_token=0
+    if [ "$os" = Linux ]; then
+      grep -a '^KANADE_NATS_TOKEN=.' "$envf" 2>/dev/null \
+        | grep -qv -e '^KANADE_NATS_TOKEN=""$' -e "^KANADE_NATS_TOKEN=''\$" && has_token=1
+    else
+      grep -aq '^KANADE_NATS_TOKEN=.' "$envf" 2>/dev/null && has_token=1
+    fi
     if [ "$os" = Linux ]; then
       sysrun=$(command -v systemd-run 2>/dev/null || true)
       sysctl=$(command -v systemctl 2>/dev/null || true)
-      if [ -n "$sysrun" ] && [ -n "$sysctl" ] && [ -d /run/systemd/system ] \
+      if [ "$has_token" -eq 1 ] && [ -n "$sysrun" ] && [ -n "$sysctl" ] && [ -d "$sdroot" ] \
          && "$sysctl" cat kanade-agent.service >/dev/null 2>&1 \
          && "$sysrun" --quiet --on-active=30 --collect --unit="kanade-nats-restart-$$" \
               "$sysctl" restart kanade-agent.service >/dev/null 2>&1; then
@@ -311,7 +324,7 @@ execute:
       # one that finds no token line exits before starting the agent, so a
       # restart would turn a running agent into a stopped one.
       if grep -q 'KANADE_NATS_USER' "$plist" 2>/dev/null \
-         && grep -q '^KANADE_NATS_TOKEN=.' "$envf" \
+         && [ "$has_token" -eq 1 ] \
          && command -v launchctl >/dev/null 2>&1; then
         nohup sh -c 'sleep 30; exec launchctl kickstart -k system/com.kanade.agent' \
           </dev/null >/dev/null 2>&1 &

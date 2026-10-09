@@ -211,6 +211,141 @@ foreach ($s in $natsSchedules.Keys) {
   if ($natsSchedules[$s] -notin $groupIds) { Add-Problem "${s}: group '$($natsSchedules[$s])' is not defined under configs/groups" }
 }
 
+# ---- 5. Unix provisioning job, run for real ----------------------------------
+# The job body is run as written, in a scratch directory: only the fixed paths
+# are pointed at it, and uname / chown / systemd-run / systemctl / launchctl /
+# sleep are stubs that log their arguments. A stub log shows that a restart was
+# requested, not that a service restarted.
+$unixJob = 'configs/jobs/provision-nats-user-unix.yaml'
+$shCmd = Get-Command sh -ErrorAction SilentlyContinue
+if (-not $shCmd) {
+  Write-Host "::warning::sh not found on PATH; skipping the run of $unixJob"
+} elseif ($null -eq $jobInfo[$unixJob] -or $null -eq $jobInfo[$unixJob].Body) {
+  Add-Problem "${unixJob}: no script body to run"
+} else {
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
+  $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("kanade-provision-test-" + [Guid]::NewGuid().ToString('N'))
+  $oldPath = $env:PATH
+  try {
+    [void](New-Item -ItemType Directory -Path $scratch)
+    $bin = Join-Path $scratch 'bin'; [void](New-Item -ItemType Directory -Path $bin)
+    $etc = Join-Path $scratch 'etc'; $sd = Join-Path $scratch 'sd'; $plistT = Join-Path $scratch 'agent.plist'
+    $log = Join-Path $scratch 'calls.log'
+    $stubs = @{
+      'uname'       = 'echo "$FAKE_OS"'
+      'chown'       = 'exit 0'
+      'sleep'       = 'exit 0'
+      'systemd-run' = 'echo "systemd-run $*" >> "$STUB_LOG"'
+      'systemctl'   = 'echo "systemctl $*" >> "$STUB_LOG"'
+      'launchctl'   = 'echo "launchctl $*" >> "$STUB_LOG"'
+    }
+    foreach ($n in $stubs.Keys) {
+      [System.IO.File]::WriteAllText((Join-Path $bin $n), "#!/bin/sh`n$($stubs[$n])`n", $utf8)
+      & chmod +x (Join-Path $bin $n)
+    }
+    $body = $jobInfo[$unixJob].Body
+    $subs = [ordered]@{
+      'dir=/etc/kanade'                                    = "dir='$etc'"
+      'plist=/Library/LaunchDaemons/com.kanade.agent.plist' = "plist='$plistT'"
+      'sdroot=/run/systemd/system'                         = "sdroot='$sd'"
+    }
+    foreach ($k in $subs.Keys) {
+      if (([regex]::Matches($body, [regex]::Escape($k))).Count -ne 1) {
+        Add-Problem "${unixJob}: test isolation expects exactly one line '$k'"
+      }
+      $body = $body.Replace($k, $subs[$k])
+    }
+    $b64 = { param([string]$s) [Convert]::ToBase64String($utf8.GetBytes($s)) }
+    $fixedErr = 'NATS password is empty'
+    $env:PATH = $bin + [System.IO.Path]::PathSeparator + $oldPath
+    $env:STUB_LOG = $log
+
+    function Invoke-Unix([string]$Case, [string]$Os, [string]$Pass, $EnvText) {
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $etc, $sd, $log, $plistT
+      [void](New-Item -ItemType Directory -Path $etc); [void](New-Item -ItemType Directory -Path $sd)
+      Set-Content -NoNewline -Path $log -Value ''
+      Set-Content -NoNewline -Path $plistT -Value 'KANADE_NATS_USER'
+      $ef = Join-Path $etc 'agent.env'
+      if ($null -ne $EnvText) { [System.IO.File]::WriteAllBytes($ef, $utf8.GetBytes($EnvText)) }
+      $script = Join-Path $scratch 'job.sh'
+      $text = $body.Replace("'REPLACE-nats-user-b64'", "'$(& $b64 'agent-user')'").Replace("'REPLACE-nats-password-b64'", "'$(& $b64 $Pass)'")
+      [System.IO.File]::WriteAllText($script, $text + "`n", $utf8)
+      $env:FAKE_OS = $Os
+      $errf = Join-Path $scratch 'err.txt'
+      $out = (& $shCmd.Source $script 2> $errf | Out-String).Trim()
+      $code = $LASTEXITCODE
+      $err = [System.IO.File]::ReadAllText($errf).Trim()
+      $leak = ($out + $err).Contains($Pass) -or ($out + $err).Contains((& $b64 $Pass))
+      if ($leak) { Add-Problem "${unixJob} [$Case]: output contains the test password" }
+      [pscustomobject]@{
+        Code = $code; Out = $out; Err = $err
+        Calls = [System.IO.File]::ReadAllText($log)
+        File = $(if (Test-Path -LiteralPath $ef) { , [System.IO.File]::ReadAllBytes($ef) } else { $null })
+      }
+    }
+    function Assert-Case([string]$Case, [bool]$Ok) { if (-not $Ok) { Add-Problem "${unixJob} [$Case]: unexpected result" } }
+    $pw = 'test-pass word'
+
+    $r = Invoke-Unix 'linux, no token line' 'Linux' $pw "OTHER=1`n"
+    Assert-Case 'linux, no token line' ($r.Code -eq 0 -and $r.Out -eq 'written (restart pending)' -and -not $r.Calls.Contains('restart'))
+    foreach ($tl in 'KANADE_NATS_TOKEN=', 'KANADE_NATS_TOKEN=""') {
+      $r = Invoke-Unix 'linux, empty token' 'Linux' $pw "$tl`n"
+      Assert-Case 'linux, empty token' ($r.Code -eq 0 -and $r.Out -eq 'written (restart pending)' -and -not $r.Calls.Contains('restart'))
+    }
+    $r = Invoke-Unix 'linux, token line' 'Linux' $pw "KANADE_NATS_TOKEN=`"t`"`n"
+    Assert-Case 'linux, token line' ($r.Code -eq 0 -and $r.Out -eq 'written (restart scheduled)' -and $r.Calls.Contains('restart kanade-agent.service'))
+    $r = Invoke-Unix 'no env file' 'Linux' $pw $null
+    Assert-Case 'no env file' ($r.Code -eq 0 -and $r.Out -eq 'written (restart pending)' -and -not $r.Calls.Contains('restart'))
+    $r = Invoke-Unix 'macos, no token line' 'Darwin' $pw "OTHER=1`n"
+    Assert-Case 'macos, no token line' ($r.Code -eq 0 -and $r.Out -eq 'written (restart pending)')
+    $r = Invoke-Unix 'macos, token line' 'Darwin' $pw "KANADE_NATS_TOKEN=t`n"
+    Assert-Case 'macos, token line' ($r.Code -eq 0 -and $r.Out -eq 'written (restart scheduled)')
+
+    foreach ($os in 'Linux', 'Darwin') {
+      $orig = 'KANADE_NATS_TOKEN="t"'
+      $r = Invoke-Unix "$os, no trailing newline" $os $pw $orig
+      $user = if ($os -eq 'Linux') { 'KANADE_NATS_USER="agent-user"' } else { 'KANADE_NATS_USER=agent-user' }
+      $pass = if ($os -eq 'Linux') { 'KANADE_NATS_PASSWORD="test-pass word"' } else { 'KANADE_NATS_PASSWORD=test-pass word' }
+      $want = $utf8.GetBytes("$user`n$pass`n$orig")
+      $same = $null -ne $r.File -and [System.Linq.Enumerable]::SequenceEqual([byte[]]$r.File, [byte[]]$want)
+      Assert-Case "$os, no trailing newline" ($r.Code -eq 0 -and $same)
+    }
+    # A second run over the file the first one wrote reports unchanged.
+    $ef = Join-Path $etc 'agent.env'
+    $again = (& $shCmd.Source (Join-Path $scratch 'job.sh') 2>$null | Out-String).Trim()
+    Assert-Case 'rerun after unterminated line' ($again -eq 'unchanged')
+
+    $blank = [ordered]@{
+      'U+3000'          = [string][char]0x3000
+      'U+00A0 U+2000'   = ([string][char]0xA0 + [char]0x2000)
+      'U+2028'          = [string][char]0x2028
+      'U+202F U+205F'   = ([string][char]0x202F + [char]0x205F)
+      'U+1680'          = [string][char]0x1680
+      'ASCII spaces'    = " `t "
+    }
+    foreach ($k in $blank.Keys) {
+      $r = Invoke-Unix "blank password $k" 'Linux' $blank[$k] "KANADE_NATS_TOKEN=t`n"
+      $untouched = $null -ne $r.File -and $utf8.GetString([byte[]]$r.File) -eq "KANADE_NATS_TOKEN=t`n"
+      Assert-Case "blank password $k" ($r.Code -ne 0 -and $r.Err -eq $fixedErr -and $r.Out -eq '' -and $untouched)
+      $r = Invoke-Unix "blank password $k, no file" 'Linux' $blank[$k] $null
+      Assert-Case "blank password $k, no file" ($r.Code -ne 0 -and $r.Err -eq $fixedErr -and $null -eq $r.File)
+    }
+    $r = Invoke-Unix 'password with inner spaces' 'Linux' ([string][char]0x3000 + 'x' + [char]0x3000) $null
+    Assert-Case 'password with inner spaces' ($r.Code -eq 0)
+    $r = Invoke-Unix 'control character' 'Linux' "a$([char]7)b" $null
+    Assert-Case 'control character' ($r.Code -ne 0 -and $r.Err -eq 'NATS password contains a control character' -and $null -eq $r.File)
+    $r = Invoke-Unix 'C1 control character' 'Linux' "a$([char]0x85)b" $null
+    Assert-Case 'C1 control character' ($r.Code -ne 0 -and $r.Err -eq 'NATS password contains a control character')
+    $r = Invoke-Unix 'password 1024 units' 'Linux' ('a' * 1024) $null
+    Assert-Case 'password 1024 units' ($r.Code -eq 0)
+    $r = Invoke-Unix 'password 1025 units' 'Linux' ('a' * 1025) $null
+    Assert-Case 'password 1025 units' ($r.Code -ne 0 -and $r.Err -eq 'NATS password is implausibly long' -and $null -eq $r.File)
+  } finally {
+    $env:PATH = $oldPath
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $scratch
+  }
+}
+
 # ---- result -----------------------------------------------------------------
 if ($script:problems.Count -gt 0) {
   Write-Host "`n$($script:problems.Count) problem(s) found." -ForegroundColor Red

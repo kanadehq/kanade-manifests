@@ -258,7 +258,10 @@ reports such a machine as not ready and the retried run clears it.
   schedules a detached restart about 30 seconds later (a transient systemd
   timer on Linux, a detached `launchctl kickstart -k` on macOS) and reports
   `written (restart scheduled)`; when it cannot, `written (restart pending)`,
-  and the pair takes effect at the next agent restart. `unchanged` never
+  and the pair takes effect at the next agent restart. On both platforms no
+  restart is scheduled when `agent.env` has no non-empty `KANADE_NATS_TOKEN`
+  line (the restarted agent would present only the pair and a broker still on
+  the shared token would refuse it). `unchanged` never
   restarts anything. A check `ok` says the file holds the pair, not that the
   running agent has loaded it, so let the restarts finish before the switch.
 - **macOS needs a launcher that passes the pair.** A LaunchDaemon plist
