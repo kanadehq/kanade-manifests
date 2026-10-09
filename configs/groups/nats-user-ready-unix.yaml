@@ -1,0 +1,24 @@
+# Linux and macOS machines whose latest check-nats-user-unix result is `ok`:
+# agent.env holds the agent role's NATS user and password (and, on macOS, the
+# launcher passes them).
+#
+#   kanade group def create configs/groups/nats-user-ready-unix.yaml
+#
+# Like nats-user-ready this lists machines that reported `ok`; it cannot list
+# machines with no result at all. For the broker-switch decision use the
+# fleet-wide NOT-ready query in configs/groups/nats-user-ready-fleet.yaml.
+#
+# `ok` is a statement about the file, not the running process: the agent loads
+# the pair at start, and the provision job schedules a restart for that. Presence
+# is not correctness either: a mistyped password is a member here.
+id: nats-user-ready-unix
+description: >-
+  Linux and macOS machines whose latest check-nats-user-unix result is ok.
+  Not a safety proof for the broker switch: see nats-user-ready-fleet.
+tags: [security, nats]
+refresh: 10m
+query: |
+  SELECT pc_id
+  FROM inventory_facts
+  WHERE job_id = 'check-nats-user-unix'
+    AND json_extract(facts_json, '$.status') = 'ok'

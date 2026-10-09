@@ -1,6 +1,7 @@
 # Carry the agent role's NATS user to every Windows machine, including the
 # ones that are offline right now.
 #
+#   kanade group def create configs/groups/windows-agents.yaml
 #   kanade job create      configs/jobs/provision-nats-user.yaml
 #   kanade schedule create configs/schedules/provision-nats-user.yaml
 #
@@ -10,6 +11,14 @@
 # one, and is locked out the moment the broker is switched. A one-shot reaches
 # only the machines that are up at that instant; a schedule keeps trying until
 # each machine has applied the current version.
+#
+# ## Why a group target
+#
+# A target has no OS filter (`all` / `groups` / `pcs` only), and `all` would also
+# start `powershell` on Linux and macOS agents, where the job fails on every
+# attempt and once_per_version keeps retrying a failed run. `windows-agents`
+# selects on the OS family the agent reports. The Unix counterpart is
+# provision-nats-user-unix.
 #
 # ## per_pc: once_per_version
 #
@@ -33,7 +42,7 @@ tags: [security, nats]
 enabled: true
 job_id: provision-nats-user
 target:
-  all: true
+  groups: [windows-agents]
 when:
   per_pc: once_per_version
 jitter: 30s

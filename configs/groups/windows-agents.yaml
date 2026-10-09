@@ -1,0 +1,20 @@
+# Machines whose agent reports a Windows OS family. A schedule or job target has
+# no OS filter of its own (`all` / `groups` / `pcs` only), so a group is how a
+# Windows-only job is kept off Linux and macOS agents: the agent would try to
+# start `powershell` there and fail on every attempt.
+#
+#   kanade group def create configs/groups/windows-agents.yaml
+#
+# `os_family` is the agent's own `std::env::consts::OS` ("windows", "linux",
+# "macos"), reported with its heartbeat. A row that has not reported one yet
+# (NULL) is kept in: every agent that can be Unix reports it, so a missing value
+# is an older Windows agent and dropping it would silently skip a machine that
+# the schedule used to reach. Membership is cached up to `refresh` old.
+id: windows-agents
+description: "Agents reporting os_family windows (or none yet, i.e. older Windows agents)"
+tags: [targeting, os]
+refresh: 10m
+query: |
+  SELECT pc_id
+  FROM agents
+  WHERE os_family = 'windows' OR os_family IS NULL

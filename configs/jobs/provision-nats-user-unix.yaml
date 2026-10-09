@@ -1,0 +1,293 @@
+# Provision the agent role's NATS user onto every Linux and macOS agent.
+#
+# The Unix counterpart of provision-nats-user (Windows). It only puts the
+# credential on the machines; the broker is not touched by anything in this
+# repository. Switching it before every agent holds the pair locks the
+# stragglers out.
+#
+#   kanade group def create configs/groups/unix-agents.yaml
+#   kanade job create       configs/jobs/provision-nats-user-unix.yaml
+#   kanade schedule create  configs/schedules/provision-nats-user-unix.yaml
+#
+# Do not apply these files as they are: use scripts/provision-nats-user.ps1,
+# which fills the placeholders into temporary copies so no secret is committed.
+#
+# ## Who runs it
+#
+# The schedule targets the `unix-agents` group (os_family linux or macos). A
+# manifest target has no OS filter of its own (`all` / `groups` / `pcs` only),
+# and the agent starts `sh -c` wherever it is told to, so the group is what
+# keeps this off Windows.
+#
+# ## What it writes
+#
+# `KANADE_NATS_USER` and `KANADE_NATS_PASSWORD` lines in /etc/kanade/agent.env,
+# in the exact format the agent's own setup script writes for that OS:
+#
+#   Linux  KANADE_NATS_USER="<value>"    systemd reads the file as an
+#          EnvironmentFile, so inside double quotes only \ " $ and the backtick
+#          are special and are backslash-escaped, exactly as setup-agent.sh does.
+#   macOS  KANADE_NATS_USER=<value>      the launcher reads the file with sed
+#          as data, so the value is stored raw.
+#
+# Every other line of the file, the KANADE_NATS_TOKEN line above all, is carried
+# over byte for byte and in order; only previous user/password lines are
+# replaced, so the pair can never be duplicated. The new file is built beside
+# the old one, set to root:root 0600, and renamed over it, so a reader sees the
+# old file or the new one, never a partial one. The existing token is never
+# parsed, printed or changed.
+#
+# ## Both values, or neither
+#
+# The pair lands in one rename. Before the rename the job creates a non-secret
+# marker file, /etc/kanade/.nats-provision-pending, and removes it only after a
+# read-back (the file equals what was built, and the lines around the pair are
+# unchanged) succeeds. A failed read-back puts the previous file back. A run
+# killed in between leaves the marker, and check-nats-user-unix reports a
+# machine with the marker as not ready; the killed run is a FAILED run, which
+# once_per_version retries. A marker beside an already-matching pair is treated
+# as such an interrupted run: the pair is rewritten, the marker cleared and the
+# restart scheduled again. The agent ignores the marker file.
+#
+# ## Taking effect: a detached, delayed restart
+#
+# The agent reads KANADE_NATS_USER / KANADE_NATS_PASSWORD from its environment
+# only at start. A new pair in the file does nothing for the running process,
+# and a machine whose agent is never restarted would be locked out the moment
+# the broker is switched while still reporting ready. So after a write the job
+# schedules a restart of the agent that it does NOT perform itself - restarting
+# the service from inside the job would kill the job's own process before it
+# reports:
+#
+#   Linux  systemd-run --on-active=30 ... systemctl restart kanade-agent.service
+#          A transient timer unit owned by systemd, outside the agent's cgroup.
+#   macOS  a detached helper that sleeps 30 s and runs
+#          launchctl kickstart -k system/com.kanade.agent
+#          with all stdio on /dev/null (an open pipe would hold the job's
+#          output capture open). It runs in the job's own session, which the
+#          agent leaves alone after a clean exit.
+#
+# The delay lets this job's result reach the backend first; the restart
+# interrupts whatever else the agent is running at that moment, and a fleet
+# restarting together reconnects together, which the once_per_version metering
+# (max_concurrent) spreads out. When the restart cannot be scheduled (no
+# systemd, no service unit, a launcher that does not pass the user pair), the
+# job still writes and reports `written (restart pending)`: the pair is in
+# effect at the next agent restart. `ok` from check-nats-user-unix means the
+# file holds the pair; it does not prove the running process has it. Do not
+# switch the broker before every agent has restarted.
+#
+# An `unchanged` result never schedules a restart.
+#
+# ## macOS prerequisite: the launcher must pass the pair
+#
+# launchd has no EnvironmentFile. The LaunchDaemon's launcher script reads
+# agent.env and exports the variables; a plist installed before user/password
+# support exports only the token, and this job does NOT rewrite the plist (it is
+# root-owned launchd configuration, owned by the agent's setup script). Update it
+# once per Mac by re-running the agent's setup-agent.sh from a current bundle
+# (it reinstalls the plist and keeps the pair already in agent.env).
+# check-nats-user-unix reports such a Mac as `fail` with the detail `launcher
+# does not pass the user pair` until then, and this job reports `restart
+# pending` for it instead of restarting uselessly. The same holds for a Mac whose
+# agent.env has no KANADE_NATS_TOKEN line: the launcher exits without starting the
+# agent in that case, so the job writes the pair but never restarts it.
+#
+# ## Placeholders
+#
+# The two values below are base64 of the UTF-8 text, not the text itself. A
+# password containing a quote, a dollar sign or a newline would otherwise break
+# the YAML or the shell script, or become code. An unfilled placeholder is not
+# valid base64, so decoding fails before anything is written. Base64 is an
+# encoding, not protection: treat the filled-in copy exactly like the plain
+# password.
+#
+# The checks match provision-nats-user: valid UTF-8, user of 1-128 characters
+# from A-Z a-z 0-9 _ . -, password not blank, no control character, at most 1024
+# UTF-16 units. (Blank means spaces only here; a Unicode space is not
+# recognised by plain sh tools.)
+#
+# ## Output
+#
+# One line: `written (restart scheduled)`, `written (restart pending)` or
+# `unchanged`. Neither value, nor anything derived from them, is ever printed
+# (a value is never put on a command line either, where `ps` could show it),
+# and error text is fixed wording for the same reason.
+id: provision-nats-user-unix
+tags: [security, nats]
+# Bump on EVERY credential change - the schedule keys "already applied" off this.
+version: 0.1.0
+description: "Provision the agent role's NATS user and password on Linux and macOS (/etc/kanade/agent.env, root only)"
+
+execute:
+  shell: sh
+  run_as: system
+  timeout: 60s
+  script: |
+    set -eu
+    LC_ALL=C
+    export LC_ALL
+
+    user_b64='REPLACE-nats-user-b64'
+    pass_b64='REPLACE-nats-password-b64'
+
+    dir=/etc/kanade
+    envf=$dir/agent.env
+    marker=$dir/.nats-provision-pending
+    plist=/Library/LaunchDaemons/com.kanade.agent.plist
+
+    fail() { echo "$1" >&2; exit 1; }
+
+    for t in base64 iconv tr wc sed grep sort cmp cat cp mv rm mktemp chown chmod uname; do
+      command -v "$t" >/dev/null 2>&1 || fail "required tool missing: $t"
+    done
+    os=$(uname -s)
+    case "$os" in
+      Linux|Darwin) ;;
+      *) fail 'unsupported operating system' ;;
+    esac
+
+    # ---- decode and validate BEFORE touching anything ----------------------
+    if printf 'QQ==' | base64 -d >/dev/null 2>&1; then dflag=-d; else dflag=-D; fi
+    dec() { printf '%s' "$1" | base64 "$dflag"; }
+    bad64='a credential value is not valid base64 UTF-8 - fill the manifest in before applying'
+    for v in "$user_b64" "$pass_b64"; do
+      case "$v" in
+        ''|*[!A-Za-z0-9+/=]*) fail "$bad64" ;;
+      esac
+      [ $(( ${#v} % 4 )) -eq 0 ] || fail "$bad64"
+      dec "$v" >/dev/null 2>&1 || fail "$bad64"
+      dec "$v" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || fail "$bad64"
+    done
+    nbytes() { wc -c | tr -d ' '; }
+    has_nul() { [ "$(dec "$1" | nbytes)" -ne "$(dec "$1" | tr -d '\000' | nbytes)" ]; }
+
+    has_nul "$user_b64" && fail 'NATS user is empty or has characters outside A-Z a-z 0-9 _ . -'
+    has_nul "$pass_b64" && fail 'NATS password contains a control character'
+
+    nats_user=$(dec "$user_b64"; printf x); nats_user=${nats_user%x}
+    case "$nats_user" in
+      ''|*[!A-Za-z0-9_.-]*) fail 'NATS user is empty or has characters outside A-Z a-z 0-9 _ . -' ;;
+    esac
+    [ ${#nats_user} -le 128 ] || fail 'NATS user is empty or has characters outside A-Z a-z 0-9 _ . -'
+
+    nats_pass=$(dec "$pass_b64"; printf x); nats_pass=${nats_pass%x}
+    case "$nats_pass" in
+      *[!' ']*) ;;
+      *) fail 'NATS password is empty' ;;
+    esac
+    units=$(dec "$pass_b64" | iconv -f UTF-8 -t UTF-16LE | nbytes)
+    [ $(( units / 2 )) -le 1024 ] || fail 'NATS password is implausibly long'
+    # C0 controls and DEL, then the C1 range U+0080-U+009F (bytes C2 80..C2 9F).
+    [ "$(dec "$pass_b64" | tr -d '[:cntrl:]' | nbytes)" -eq "$(dec "$pass_b64" | nbytes)" ] \
+      || fail 'NATS password contains a control character'
+    if dec "$pass_b64" | grep -aq "$(printf '\302[\200-\237]')"; then
+      fail 'NATS password contains a control character'
+    fi
+
+    # ---- the lines, in the format the agent's setup script writes ----------
+    env_quote() { printf '%s' "$1" | sed -e 's/[\\"$`]/\\&/g'; }
+    if [ "$os" = Linux ]; then
+      user_line="KANADE_NATS_USER=\"$(env_quote "$nats_user")\""
+      pass_line="KANADE_NATS_PASSWORD=\"$(env_quote "$nats_pass")\""
+    else
+      user_line="KANADE_NATS_USER=$nats_user"
+      pass_line="KANADE_NATS_PASSWORD=$nats_pass"
+    fi
+    nats_user=; nats_pass=
+
+    [ -d "$dir" ] || fail "$dir is not present - refusing to create it. Deploy this host first."
+
+    # ---- build the new file beside the old one ------------------------------
+    umask 077
+    rest=; new=; exp=; orig=
+    cleanup() { rm -f -- "$rest" "$new" "$exp" "$orig"; }
+    trap cleanup EXIT
+    trap 'exit 1' HUP INT TERM
+    # Leftovers of a run that was killed before its rename.
+    rm -f -- "$dir"/.nats-provision.* 2>/dev/null || true
+    rest=$(mktemp "$dir/.nats-provision.XXXXXX")
+    new=$(mktemp "$dir/.nats-provision.XXXXXX")
+    exp=$(mktemp "$dir/.nats-provision.XXXXXX")
+
+    pair_re_user='^KANADE_NATS_USER='
+    pair_re_pass='^KANADE_NATS_PASSWORD='
+    if [ -f "$envf" ]; then
+      grep -a -v -e "$pair_re_user" -e "$pair_re_pass" "$envf" > "$rest" \
+        || [ "$?" -eq 1 ] || fail 'could not read the agent env file'
+    fi
+    { cat "$rest"; printf '%s\n' "$user_line" "$pass_line"; } > "$new"
+    user_line=; pass_line=
+    chown 0:0 "$new"
+    chmod 0600 "$new"
+
+    # ---- idempotence ---------------------------------------------------------
+    # The pair counts as already in place wherever its two lines sit in the file
+    # (setup-agent.sh writes it after the token, but order carries no meaning to
+    # either reader); a duplicate or a different value does not match.
+    same=0
+    if [ -f "$envf" ] && [ ! -e "$marker" ]; then
+      grep -a -e "$pair_re_user" -e "$pair_re_pass" "$new" | sort > "$exp"
+      grep -a -e "$pair_re_user" -e "$pair_re_pass" "$envf" | sort | cmp -s - "$exp" && same=1
+    fi
+    if [ "$same" -eq 1 ]; then
+      chown 0:0 "$envf"
+      chmod 0600 "$envf"
+      echo unchanged
+      exit 0
+    fi
+
+    # ---- write: marker, rename, read-back; restore on failure ----------------
+    cp "$new" "$exp"
+    if [ -f "$envf" ]; then
+      orig=$(mktemp "$dir/.nats-provision.XXXXXX")
+      cp -p "$envf" "$orig"
+    fi
+    : > "$marker"
+    if ! mv -f "$new" "$envf"; then
+      rm -f -- "$marker"
+      fail 'writing the NATS credential failed; the previous state was kept'
+    fi
+    good=1
+    cmp -s "$exp" "$envf" || good=0
+    grep -a -v -e "$pair_re_user" -e "$pair_re_pass" "$envf" | cmp -s - "$rest" || good=0
+    [ "$(grep -a -c "$pair_re_user" "$envf" || true)" = 1 ] || good=0
+    [ "$(grep -a -c "$pair_re_pass" "$envf" || true)" = 1 ] || good=0
+    if [ "$good" -ne 1 ]; then
+      # The marker stays if the restore itself fails, so the machine still
+      # reads as not ready.
+      restored=0
+      if [ -n "$orig" ]; then
+        mv -f "$orig" "$envf" && restored=1 && orig=
+      else
+        rm -f -- "$envf" && restored=1
+      fi
+      [ "$restored" -ne 1 ] || rm -f -- "$marker"
+      fail 'writing the NATS credential failed; the previous state was restored'
+    fi
+    rm -f -- "$marker"
+
+    # ---- make it take effect: detached, delayed, never from inside the job ---
+    restart=pending
+    if [ "$os" = Linux ]; then
+      sysrun=$(command -v systemd-run 2>/dev/null || true)
+      sysctl=$(command -v systemctl 2>/dev/null || true)
+      if [ -n "$sysrun" ] && [ -n "$sysctl" ] && [ -d /run/systemd/system ] \
+         && "$sysctl" cat kanade-agent.service >/dev/null 2>&1 \
+         && "$sysrun" --quiet --on-active=30 --collect --unit="kanade-nats-restart-$$" \
+              "$sysctl" restart kanade-agent.service >/dev/null 2>&1; then
+        restart=scheduled
+      fi
+    else
+      # A launcher that does not export the pair would restart for nothing, and
+      # one that finds no token line exits before starting the agent, so a
+      # restart would turn a running agent into a stopped one.
+      if grep -q 'KANADE_NATS_USER' "$plist" 2>/dev/null \
+         && grep -q '^KANADE_NATS_TOKEN=.' "$envf" \
+         && command -v launchctl >/dev/null 2>&1; then
+        nohup sh -c 'sleep 30; exec launchctl kickstart -k system/com.kanade.agent' \
+          </dev/null >/dev/null 2>&1 &
+        restart=scheduled
+      fi
+    fi
+    echo "written (restart $restart)"

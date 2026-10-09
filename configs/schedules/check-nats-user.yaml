@@ -1,4 +1,8 @@
-# Fires the registered `check-nats-user` job per-PC every hour.
+# Fires the registered `check-nats-user` job per-PC every hour on Windows agents.
+#
+# The target is the `windows-agents` group, not `all`: a target has no OS filter,
+# and `all` would also start `powershell` on Linux and macOS agents, where it
+# fails on every run. The Unix counterpart is check-nats-user-unix.
 #
 # Hourly rather than the 4h/24h of the other checks: this one is watched
 # during a rollout, where the operator waits for machines to come back and
@@ -6,6 +10,7 @@
 # registry key, so the cost is negligible. Once the broker is switched it can
 # be relaxed or the schedule disabled.
 #
+#   kanade group def create configs/groups/windows-agents.yaml
 #   kanade schedule create configs/schedules/check-nats-user.yaml
 id: check-nats-user
 when:
@@ -13,6 +18,6 @@ when:
 enabled: true
 job_id: check-nats-user
 target:
-  all: true
+  groups: [windows-agents]
 jitter: 5m
 tags: [health-check, security, nats]

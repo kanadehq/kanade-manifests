@@ -1,0 +1,114 @@
+# Operator-defined HEALTH CHECK: does this Linux or macOS machine hold the agent
+# role's NATS user and password?
+#
+#   kanade job create      configs/jobs/check-nats-user-unix.yaml
+#   kanade schedule create configs/schedules/check-nats-user-unix.yaml
+#
+# The Unix counterpart of check-nats-user (Windows), with its own job id and
+# `check.name` so the Windows readiness group and its not-ready query are not
+# affected. It answers one question before the broker is switched: which
+# machines would be locked out because they never received the pair. It reports
+# presence only: `{"present": true|false}`, a status and a short fixed detail.
+# No length, hash or prefix of either value is emitted, so the result is safe to
+# store and show.
+#
+# ## Presence is not correctness, and not "in effect"
+#
+# A mistyped password is present, so this check passes it and the machine is
+# locked out at the switch. And `ok` means /etc/kanade/agent.env holds the pair,
+# not that the running agent has loaded it: the agent reads the environment at
+# start only. See the README section "NATS role credentials, before the switch".
+#
+# ## Why system
+#
+# agent.env is root:root 0600. In any other context this would read nothing and
+# report every machine as not present, so `run_as: system` is required.
+#
+# ## macOS: the launcher must pass the pair
+#
+# launchd has no EnvironmentFile; the LaunchDaemon's launcher script exports the
+# variables. A plist installed before user/password support exports only the
+# token, so a pair in agent.env would never reach the agent. The installed
+# /Library/LaunchDaemons/com.kanade.agent.plist is therefore read (never
+# written): when it does not mention KANADE_NATS_USER the result is `fail` with
+# the detail `launcher does not pass the user pair`, even though the pair is in
+# the file (`present` stays true: it is on the machine). The fix is a one-time
+# re-run of the agent's setup-agent.sh, not this repository's job.
+#
+# ## Read-only, and stdout is the contract
+#
+# It never provisions; fixing a machine is the provision job's work. Stdout is
+# exactly one JSON line, because anything else on it silently breaks the
+# projection.
+#
+# status: ok = both values present and non-empty (an empty "" counts as
+# empty) and, on macOS, the launcher passes them; fail = file absent, a value
+# missing or empty (including a lone half of the pair), the provision job's
+# pending marker is set (a write was interrupted), or the macOS launcher does
+# not pass the pair; unknown = the check itself errored.
+id: check-nats-user-unix
+version: 0.1.0
+description: NATS role credential present on this Linux or macOS machine (presence only, never the value)
+tags: [health-check, security, nats]
+execute:
+  shell: sh
+  run_as: system
+  timeout: 30s
+  script: |
+    LC_ALL=C
+    export LC_ALL
+    envf=/etc/kanade/agent.env
+    marker=/etc/kanade/.nats-provision-pending
+    plist=/Library/LaunchDaemons/com.kanade.agent.plist
+
+    status=unknown; detail='check failed'; present=false
+
+    # Reads a value into memory only; it is tested, never printed or put on a
+    # command line.
+    pair_value() { sed -n "s/^$1=//p" "$envf" 2>/dev/null | head -n 1; }
+    # Linux writes the value inside double quotes (an EnvironmentFile); macOS
+    # stores it raw. Take one surrounding pair off so "" counts as empty.
+    unquote() {
+      case "$1" in
+        \"*\") v=${1#\"}; printf '%s' "${v%\"}" ;;
+        *) printf '%s' "$1" ;;
+      esac
+    }
+    has_text() { case "$1" in *[![:space:]]*) return 0 ;; *) return 1 ;; esac; }
+
+    os=$(uname -s 2>/dev/null) || os=
+    if [ -e "$marker" ]; then
+      status=fail; detail='provisioning was interrupted; waiting for a retry'
+    elif [ ! -e "$envf" ]; then
+      status=fail; detail='agent env file not present'
+    elif [ ! -r "$envf" ]; then
+      status=unknown; detail='could not read the agent env file'
+    else
+      u=$(pair_value KANADE_NATS_USER); p=$(pair_value KANADE_NATS_PASSWORD)
+      if [ "$os" = Linux ]; then u=$(unquote "$u"); p=$(unquote "$p"); fi
+      uOk=0; pOk=0
+      has_text "$u" && uOk=1
+      has_text "$p" && pOk=1
+      u=; p=
+      if [ "$uOk" = 1 ] && [ "$pOk" = 1 ]; then
+        present=true
+        if [ "$os" = Darwin ] && ! grep -q 'KANADE_NATS_USER' "$plist" 2>/dev/null; then
+          status=fail; detail='launcher does not pass the user pair'
+        else
+          status=ok; detail='user and password present'
+        fi
+      elif [ "$uOk" = 1 ] || [ "$pOk" = 1 ]; then
+        status=fail; detail='only one of user and password present'
+      else
+        status=fail; detail='user and password not present'
+      fi
+    fi
+    printf '{"status":"%s","detail":"%s","present":%s}\n' "$status" "$detail" "$present"
+check:
+  name: nats_user_unix
+  label: "NATS ロール資格情報 (Linux/macOS)"
+inventory:
+  display:
+    - { field: status, label: NATS user }
+    - { field: detail, label: Detail }
+    - { field: present, label: Present }

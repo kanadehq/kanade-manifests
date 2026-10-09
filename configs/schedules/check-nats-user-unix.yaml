@@ -1,0 +1,22 @@
+# Fires the registered `check-nats-user-unix` job per-PC every hour on Linux and
+# macOS agents.
+#
+# Hourly for the same reason as check-nats-user: this one is watched during a
+# rollout, where the operator waits for machines to come back and report. The
+# read is a single small file, so the cost is negligible. Once the broker is
+# switched it can be relaxed or the schedule disabled.
+#
+# The target is the `unix-agents` group, not `all`: a target has no OS filter,
+# and `all` would also run this `sh` script on Windows agents.
+#
+#   kanade group def create configs/groups/unix-agents.yaml
+#   kanade schedule create  configs/schedules/check-nats-user-unix.yaml
+id: check-nats-user-unix
+when:
+  per_pc: { every: 1h }
+enabled: true
+job_id: check-nats-user-unix
+target:
+  groups: [unix-agents]
+jitter: 5m
+tags: [health-check, security, nats]
