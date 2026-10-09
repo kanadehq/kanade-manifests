@@ -103,9 +103,9 @@
 # password.
 #
 # The checks match provision-nats-user: valid UTF-8, user of 1-128 characters
-# from A-Z a-z 0-9 _ . -, password not blank, no control character, at most 1024
-# UTF-16 units. (Blank means spaces only here; a Unicode space is not
-# recognised by plain sh tools.)
+# from A-Z a-z 0-9 _ . -, password not blank (the same white space set as
+# IsNullOrWhiteSpace, Unicode spaces included), no control character, at most
+# 1024 UTF-16 units.
 #
 # ## Output
 #
@@ -172,10 +172,18 @@ execute:
     [ ${#nats_user} -le 128 ] || fail 'NATS user is empty or has characters outside A-Z a-z 0-9 _ . -'
 
     nats_pass=$(dec "$pass_b64"; printf x); nats_pass=${nats_pass%x}
-    case "$nats_pass" in
-      *[!' ']*) ;;
-      *) fail 'NATS password is empty' ;;
-    esac
+    # Blank = only the characters .NET IsNullOrWhiteSpace treats as white space.
+    # Strip the multi-byte ones (whole UTF-8 sequences), then ASCII ones.
+    stripped=$(dec "$pass_b64" | sed \
+      -e "s/$(printf '\302[\205\240]')//g" \
+      -e "s/$(printf '\341\232\200')//g" \
+      -e "s/$(printf '\342\200[\200-\212\250\251\257]')//g" \
+      -e "s/$(printf '\342\201\237')//g" \
+      -e "s/$(printf '\343\200\200')//g" \
+      | tr -d ' \011\012\013\014\015' | nbytes)
+    if [ "$stripped" -eq 0 ]; then
+      fail 'NATS password is empty'
+    fi
     units=$(dec "$pass_b64" | iconv -f UTF-8 -t UTF-16LE | nbytes)
     [ $(( units / 2 )) -le 1024 ] || fail 'NATS password is implausibly long'
     # C0 controls and DEL, then the C1 range U+0080-U+009F (bytes C2 80..C2 9F).
