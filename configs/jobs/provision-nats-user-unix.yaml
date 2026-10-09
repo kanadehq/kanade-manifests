@@ -220,11 +220,31 @@ execute:
 
     pair_re_user='^KANADE_NATS_USER='
     pair_re_pass='^KANADE_NATS_PASSWORD='
+    # The file minus any pair lines, byte for byte: a final line with no
+    # newline stays without one (grep would add it).
+    strip_pair() {
+      l=
+      while IFS= read -r l; do
+        case "$l" in
+          KANADE_NATS_USER=*|KANADE_NATS_PASSWORD=*) ;;
+          *) printf '%s\n' "$l" ;;
+        esac
+        l=
+      done < "$1"
+      case "$l" in
+        ''|KANADE_NATS_USER=*|KANADE_NATS_PASSWORD=*) ;;
+        *) printf '%s' "$l" ;;
+      esac
+    }
     if [ -f "$envf" ]; then
-      grep -a -v -e "$pair_re_user" -e "$pair_re_pass" "$envf" > "$rest" \
-        || [ "$?" -eq 1 ] || fail 'could not read the agent env file'
+      strip_pair "$envf" > "$rest" || fail 'could not read the agent env file'
     fi
-    { cat "$rest"; printf '%s\n' "$user_line" "$pass_line"; } > "$new"
+    # An unterminated last line would swallow the pair, so the pair goes first.
+    if [ -s "$rest" ] && [ -n "$(tail -c 1 "$rest")" ]; then
+      { printf '%s\n' "$user_line" "$pass_line"; cat "$rest"; } > "$new"
+    else
+      { cat "$rest"; printf '%s\n' "$user_line" "$pass_line"; } > "$new"
+    fi
     user_line=; pass_line=
     chown 0:0 "$new"
     chmod 0600 "$new"
@@ -258,7 +278,7 @@ execute:
     fi
     good=1
     cmp -s "$exp" "$envf" || good=0
-    grep -a -v -e "$pair_re_user" -e "$pair_re_pass" "$envf" | cmp -s - "$rest" || good=0
+    strip_pair "$envf" | cmp -s - "$rest" || good=0
     [ "$(grep -a -c "$pair_re_user" "$envf" || true)" = 1 ] || good=0
     [ "$(grep -a -c "$pair_re_pass" "$envf" || true)" = 1 ] || good=0
     if [ "$good" -ne 1 ]; then
